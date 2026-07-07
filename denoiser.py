@@ -26,6 +26,30 @@ from qiskit_aer.primitives import EstimatorV2 as AerEstimator
 DEFAULT_BASIS_GATES = ["rz", "sx", "x", "cx"]
 
 
+def _prepare_parameter_values(ansatz: QuantumCircuit, params) -> np.ndarray:
+    """Normalize parameter values for Qiskit estimators.
+
+    Qiskit expects either an empty sequence for unparameterized circuits or a
+    1D array whose length matches the number of circuit parameters.
+    """
+    if params is None:
+        return np.array([], dtype=float)
+
+    values = np.asarray(params, dtype=float)
+    if values.ndim == 0:
+        values = values.reshape(1)
+
+    if ansatz.num_parameters == 0:
+        return np.array([], dtype=float)
+
+    if values.size != ansatz.num_parameters:
+        raise ValueError(
+            f"Expected {ansatz.num_parameters} parameter value(s), received {values.size}."
+        )
+
+    return values
+
+
 # --------------------------------------------------------------------------- #
 # 1. Ideal (noiseless) simulator
 # --------------------------------------------------------------------------- #
@@ -37,7 +61,8 @@ def get_ideal_estimator() -> StatevectorEstimator:
 def run_ideal(ansatz: QuantumCircuit, hamiltonian, params: np.ndarray) -> float:
     """Evaluate <H> on the ideal simulator for the given parameters."""
     estimator = get_ideal_estimator()
-    job = estimator.run([(ansatz, hamiltonian, params)])
+    parameter_values = _prepare_parameter_values(ansatz, params)
+    job = estimator.run([(ansatz, hamiltonian, parameter_values)])
     return float(job.result()[0].data.evs)
 
 
@@ -90,7 +115,8 @@ def run_noisy(
     """Evaluate <H> on the noisy simulator for the given parameters."""
     ansatz_t = transpile(ansatz, basis_gates=list(basis_gates), optimization_level=1)
     estimator = get_noisy_estimator(noise_model, shots=shots)
-    job = estimator.run([(ansatz_t, hamiltonian, params)])
+    parameter_values = _prepare_parameter_values(ansatz_t, params)
+    job = estimator.run([(ansatz_t, hamiltonian, parameter_values)])
     return float(job.result()[0].data.evs)
 
 
@@ -140,7 +166,8 @@ def zne_extrapolate(
     energies = []
     for scale in scale_factors:
         folded_circuit = fold_circuit(ansatz_t, scale)
-        job = estimator.run([(folded_circuit, hamiltonian, params)])
+        parameter_values = _prepare_parameter_values(folded_circuit, params)
+        job = estimator.run([(folded_circuit, hamiltonian, parameter_values)])
         energies.append(float(job.result()[0].data.evs))
 
     scale_factors = np.array(scale_factors, dtype=float)
@@ -213,17 +240,31 @@ def run_noise_comparison(
 
 
 if __name__ == "__main__":
-    from hamiltonian import get_qubit_hamiltonian, get_reference_energy
-    from ansatz import get_ansatz
+    try:
+        from hamiltonian import get_qubit_hamiltonian, get_reference_energy
+        from ansatz import get_ansatz
 
-    qubit_op, problem, mapper = get_qubit_hamiltonian("H2", mapping="jordan_wigner")
-    ansatz, _ = get_ansatz("twolocal", problem=problem, mapper=mapper, reps=1)
+        qubit_op, problem, mapper = get_qubit_hamiltonian("H2", mapping="jordan_wigner")
+        ansatz, _ = get_ansatz("twolocal", problem=problem, mapper=mapper, reps=1)
 
-    rng = np.random.default_rng(0)
-    params = rng.uniform(-0.1, 0.1, ansatz.num_parameters)
+        rng = np.random.default_rng(0)
+        params = rng.uniform(-0.1, 0.1, ansatz.num_parameters)
 
-    ref = get_reference_energy(problem) - problem.nuclear_repulsion_energy  # electronic part
-    report = run_noise_comparison(ansatz, qubit_op, params, reference_energy=ref)
+        ref = get_reference_energy(problem) - problem.nuclear_repulsion_energy  # electronic part
+        report = run_noise_comparison(ansatz, qubit_op, params, reference_energy=ref)
+    except Exception as exc:
+        print(
+            f"Falling back to a synthetic circuit example because the chemistry stack is unavailable: {exc}"
+        )
+
+        from qiskit import QuantumCircuit
+        from qiskit.quantum_info import SparsePauliOp
+
+        circuit = QuantumCircuit(1)
+        circuit.ry(0.2, 0)
+        observable = SparsePauliOp(["Z"])
+        params = np.array([0.2])
+        report = run_noise_comparison(circuit, observable, params, reference_energy=0.0)
 
     for k in ["ideal_energy", "noisy_energy", "zne_energy", "ideal_error", "noisy_error", "zne_error"]:
         print(f"{k}: {report[k]:.6f}")
