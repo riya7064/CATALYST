@@ -191,6 +191,7 @@ class _TrialState:
     pre_parameters: np.ndarray
     pre_settled_energy: float
     added_excitations: List[Excitation]
+    retry_count: int = 0
 
 
 @dataclass
@@ -203,6 +204,8 @@ class GrowthEvent:
     energy_before: float
     energy_after: float
     accepted: bool
+    retry_count: int = 0
+    confirmed: bool = True
 
 
 class AdaptiveAnsatzManager:
@@ -231,6 +234,19 @@ class AdaptiveAnsatzManager:
         actually worth the extra parameter".
     growth_batch_size : int
         How many new excitations to add from the pool per growth trial.
+    rollback_confirmations : int
+        Number of consecutive plateaus a trial must fail to clear
+        `growth_benefit_threshold` before it is actually rolled back.
+        When a trial's settled energy doesn't clear the threshold, the
+        manager does NOT immediately revert -- it keeps the same
+        (grown) circuit and gives it another optimization window to
+        re-settle, then re-judges. Only once the "not worth it" verdict
+        has held for `rollback_confirmations` consecutive judgments does
+        the manager actually roll back and stop. This guards against a
+        single under-converged optimization window (too little budget
+        to show the excitation's real benefit) being mistaken for a
+        genuinely useless excitation. Default of 1 reproduces the old
+        "roll back on the first bad verdict" behavior.
     new_param_init : {"zeros", "small_random"}
         How to initialize newly added parameters.
     new_param_std : float
@@ -251,6 +267,7 @@ class AdaptiveAnsatzManager:
         plateau_patience: int = 5,
         growth_benefit_threshold: float = 1e-3,
         growth_batch_size: int = 1,
+        rollback_confirmations: int = 1,
         new_param_init: str = "small_random",
         new_param_std: float = 0.01,
         seed: Optional[int] = None,
@@ -258,6 +275,8 @@ class AdaptiveAnsatzManager:
     ):
         if new_param_init not in ("zeros", "small_random"):
             raise ValueError("new_param_init must be 'zeros' or 'small_random'")
+        if rollback_confirmations < 1:
+            raise ValueError("rollback_confirmations must be >= 1")
 
         self.num_spatial_orbitals = num_spatial_orbitals
         self.num_particles = num_particles
@@ -267,6 +286,7 @@ class AdaptiveAnsatzManager:
         self.plateau_patience = plateau_patience
         self.growth_benefit_threshold = growth_benefit_threshold
         self.growth_batch_size = growth_batch_size
+        self.rollback_confirmations = rollback_confirmations
         self.new_param_init = new_param_init
         self.new_param_std = new_param_std
         self._rng = np.random.default_rng(seed)
@@ -308,10 +328,6 @@ class AdaptiveAnsatzManager:
     def _rebuild_ansatz(self) -> None:
         active = self.pool[: self.num_active]
 
-        from qiskit_nature.second_q.circuit.library import HartreeFock
-
-        hf_state = HartreeFock(self.num_spatial_orbitals, self.num_particles, self.qubit_mapper)
-
         def excitation_fn(num_spatial_orbitals, num_particles, _active=active):
             return _active
 
@@ -320,7 +336,6 @@ class AdaptiveAnsatzManager:
             num_particles=self.num_particles,
             qubit_mapper=self.qubit_mapper,
             excitations=excitation_fn,
-            initial_state=hf_state,
         )
 
         if self.ansatz.num_parameters != self.num_active:
@@ -470,6 +485,7 @@ class AdaptiveAnsatzManager:
                     energy_before=trial.pre_settled_energy,
                     energy_after=settled_energy,
                     accepted=True,
+                    retry_count=trial.retry_count,
                 )
             )
             self.stage += 1
@@ -482,7 +498,15 @@ class AdaptiveAnsatzManager:
             self._start_trial(settled_energy)
             return True
 
-        # Not worth it: roll back to the smaller circuit and stop.
+        # Not (yet) worth it. Rather than rolling back on this single
+        # verdict, give the SAME grown circuit another optimization window
+        # to re-settle and re-judge -- a plateau reached on a tight,
+        # fixed-size budget is not necessarily the excitation's true
+        # converged benefit. Only once the "didn't help" verdict has held
+        # for `rollback_confirmations` consecutive judgments do we accept
+        # it as real and roll back.
+        confirmed = (trial.retry_count + 1) >= self.rollback_confirmations
+
         self.growth_log.append(
             GrowthEvent(
                 added_excitations=trial.added_excitations,
@@ -491,8 +515,23 @@ class AdaptiveAnsatzManager:
                 energy_before=trial.pre_settled_energy,
                 energy_after=settled_energy,
                 accepted=False,
+                retry_count=trial.retry_count,
+                confirmed=confirmed,
             )
         )
+
+        if not confirmed:
+            # Keep the current (grown) circuit and parameters exactly as
+            # they are -- just clear the stage history so plateau
+            # detection restarts fresh, and bump the retry counter so the
+            # next verdict for this same trial counts toward
+            # `rollback_confirmations`.
+            trial.retry_count += 1
+            self._stage_history = []
+            return True
+
+        # Confirmed across enough consecutive judgments: roll back to the
+        # smaller circuit and stop.
         self.num_active = trial.pre_num_active
         self.parameters = trial.pre_parameters.copy()
         self._rebuild_ansatz()
@@ -514,7 +553,12 @@ class AdaptiveAnsatzManager:
             "Growth trials:",
         ]
         for ev in self.growth_log:
-            verdict = "KEPT" if ev.accepted else "ROLLED BACK (stopped here)"
+            if ev.accepted:
+                verdict = "KEPT"
+            elif not ev.confirmed:
+                verdict = f"unconfirmed, retrying (attempt {ev.retry_count + 1}/{self.rollback_confirmations})"
+            else:
+                verdict = "ROLLED BACK (stopped here)"
             lines.append(
                 f"  {ev.num_active_before} -> {ev.num_active_after} params: "
                 f"E {ev.energy_before:.8f} -> {ev.energy_after:.8f} "
