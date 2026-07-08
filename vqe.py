@@ -146,7 +146,7 @@ def run_baseline_vqe(
     runner = SingleOptimizerRunner(optimizer_name, maxiter=maxiter)
     report = runner.optimize(cost_fn, x0)
 
-    computed_total_energy = report["final_energy"] + nuclear_repulsion
+    computed_total_energy = report.final_energy + nuclear_repulsion
     reference_total_energy = get_reference_energy(problem)
 
     return {
