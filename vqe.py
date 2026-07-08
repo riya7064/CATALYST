@@ -421,10 +421,9 @@ def run_learned_adaptive_ansatz(
             phases_log = [(p.optimizer, p.iterations, p.reason) for p in stage_report.phases]
             switched_at_eval = stage_report.switched_at_eval
         except AnsatzGrowthSignal:
-            # The manager grew or rolled back mid-optimization -- this is
-            # the expected, normal way a stage now ends. Pull the latest
-            # true state straight from the manager/history rather than a
-            # stage_report that was never produced.
+            # The manager has already updated its circuit and parameter vector.
+            # Simply end this stage and let the outer while-loop restart using
+            # manager.initial_point.
             final_energy_this_stage = manager.full_energy_history[-1]
             phases_log = []
             switched_at_eval = None

@@ -265,10 +265,22 @@ class GrowthObservingCostFunction:
         self.cost_fn.phase = value
 
     def __call__(self, params: np.ndarray) -> float:
+        params = np.asarray(params)
+
+        # Safety check: if the optimizer somehow hands us a parameter vector
+        # whose length no longer matches the current ansatz, abort immediately.
+        # This prevents Qiskit from trying to bind 8 parameters onto a
+        # 9-parameter circuit.
+        if params.size != self.manager.circuit.num_parameters:
+            raise AnsatzGrowthSignal(is_done=self.manager.is_done)
+
         energy = self.cost_fn(params)
+
         changed = self.manager.observe(energy, params=params)
+
         if changed:
             raise AnsatzGrowthSignal(is_done=self.manager.is_done)
+
         return energy
 
 
@@ -470,7 +482,14 @@ class AdaptiveAnsatzManager:
         self.full_energy_history.append(energy)
         self._stage_history.append(energy)
         if params is not None:
-            self.parameters = np.asarray(params, dtype=float)
+            params = np.asarray(params, dtype=float)
+
+            # Ignore stale parameter vectors that belong to the previous
+            # ansatz size. This can happen because some optimizers (notably
+            # SPSA in qiskit-algorithms 0.4.x) may perform one additional
+            # callback after the ansatz has already been grown.
+            if params.size == self.num_active:
+                self.parameters = params.copy()
 
         if self._done:
             return False

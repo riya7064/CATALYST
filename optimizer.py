@@ -345,6 +345,14 @@ class VQECostFunction:
         self._phase = value
 
     def __call__(self, params: np.ndarray) -> float:
+        params = np.asarray(params)
+
+        if params.size != self.ansatz.num_parameters:
+            raise RuntimeError(
+                f"Parameter mismatch: ansatz expects "
+                f"{self.ansatz.num_parameters} parameters, "
+                f"received {params.size}."
+            )
         job = self.estimator.run([(self.ansatz, self.hamiltonian, params)])
         energy = float(job.result()[0].data.evs)
         self.history.record(energy, params, phase=self._phase)
@@ -442,7 +450,15 @@ class AdaptiveVQEOptimizer:
             termination_checker=termination_checker,
             **self.spsa_kwargs,
         )
-        result = spsa.minimize(fun=cost_fn, x0=x_current)
+
+        try:
+            result = spsa.minimize(fun=cost_fn, x0=x_current)
+        except AnsatzGrowthSignal:
+            # Normal event: the adaptive ansatz has grown (or rolled back).
+            # Abort this optimizer phase immediately and let the outer growth
+            # loop restart SPSA/COBYLA on the new circuit.
+            raise
+
         x_current = result.x
 
         spsa_iters_used = int(getattr(result, "nit", total_budget) or total_budget)
