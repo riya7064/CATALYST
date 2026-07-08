@@ -308,6 +308,10 @@ class AdaptiveAnsatzManager:
     def _rebuild_ansatz(self) -> None:
         active = self.pool[: self.num_active]
 
+        from qiskit_nature.second_q.circuit.library import HartreeFock
+
+        hf_state = HartreeFock(self.num_spatial_orbitals, self.num_particles, self.qubit_mapper)
+
         def excitation_fn(num_spatial_orbitals, num_particles, _active=active):
             return _active
 
@@ -316,6 +320,7 @@ class AdaptiveAnsatzManager:
             num_particles=self.num_particles,
             qubit_mapper=self.qubit_mapper,
             excitations=excitation_fn,
+            initial_state=hf_state,
         )
 
         if self.ansatz.num_parameters != self.num_active:

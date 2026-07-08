@@ -119,6 +119,30 @@ def get_electronic_structure_problem(driver):
 	return driver.run()
 
 
+def get_mapper(name: str = "jordan_wigner"):
+	"""Return a qubit mapper for the requested encoding."""
+	key = name.strip().lower()
+	if key in {"jordan_wigner", "jw"}:
+		from qiskit_nature.second_q.mappers import JordanWignerMapper
+
+		return JordanWignerMapper()
+	if key in {"bravyi_kitaev", "bk"}:
+		from qiskit_nature.second_q.mappers import BravyiKitaevMapper
+
+		return BravyiKitaevMapper()
+	raise ValueError(f"Unknown mapping '{name}'. Use 'jordan_wigner' or 'bravyi_kitaev'.")
+
+
+def get_reference_energy(problem) -> float:
+	"""Return the exact ground-state energy for a Qiskit Nature problem."""
+	from qiskit_algorithms import NumPyMinimumEigensolver
+
+	mapper = get_mapper("jordan_wigner")
+	qubit_op = mapper.map(problem.hamiltonian.second_q_op())
+	result = NumPyMinimumEigensolver().compute_minimum_eigenvalue(qubit_op)
+	return float(result.eigenvalue.real) + problem.nuclear_repulsion_energy
+
+
 def get_second_q_hamiltonian(problem):
 	"""Extract the fermionic second-quantized Hamiltonian from a Qiskit Nature problem."""
 	if hasattr(problem, "hamiltonian") and hasattr(problem.hamiltonian, "second_q_op"):
