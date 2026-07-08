@@ -80,6 +80,13 @@ from qiskit_algorithms.optimizers import (
     GradientDescent,
 )
 
+# Raised by learned_ansatz.GrowthObservingCostFunction when the growth
+# manager grows or rolls back mid-optimization. This is a *signal*, not a
+# real optimizer failure, so it must never be swallowed by the generic
+# `except Exception` fallback below -- it needs to propagate all the way
+# out to the growth loop in vqe.py.
+from learned_ansatz import AnsatzGrowthSignal
+
 logger = logging.getLogger(__name__)
 
 
@@ -460,6 +467,10 @@ class AdaptiveVQEOptimizer:
                 x_current = result.x
                 cobyla_iters = int(getattr(result, "nit", remaining) or remaining)
                 phases.append(PhaseRecord("cobyla", cobyla_iters, "refinement phase"))
+            except AnsatzGrowthSignal:
+                # Not a COBYLA failure -- the growth manager just changed
+                # the ansatz mid-run. Let it propagate to the growth loop.
+                raise
             except Exception as exc:
                 logger.warning("COBYLA phase failed (%s); falling back to %s", exc, self.fallback_name)
                 cost_fn.phase = self.fallback_name
