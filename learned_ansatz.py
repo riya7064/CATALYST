@@ -3,45 +3,48 @@ learned_ansatz.py
 
 Adaptive UCCSD ansatz builder for VQE.
 
-Strategy (Option 2 + ADAPT-style trial/rollback growth):
+Strategy (ADAPT-VQE: gradient-screened growth):
 
-    Start with a singles-only UCC ansatz. When the optimization on the
-    current circuit plateaus (energy stops improving for several
-    consecutive evaluations), *try* growing: append the next excitation(s)
-    from a pre-generated pool and optimize again.
+    Start with a singles-only UCC ansatz and optimize. When the
+    optimization on the current circuit plateaus (energy stops improving
+    for several consecutive evaluations), decide what to grow by
+    screening -- not by trial-and-optimize.
 
-    This is treated as a TRIAL, not a guaranteed improvement. Once the new,
-    bigger circuit also plateaus, we compare its settled energy to the
-    settled energy right before we grew:
+    Screening means: for every excitation still outside the ansatz,
+    compute a cheap energy gradient at the *current* optimized parameters
+    with the candidate's own parameter fixed at 0 (a 2-point finite
+    difference, no optimizer run). Whichever candidate(s) have the largest
+    |gradient| are the ones actually worth paying for, so only those get
+    added, and only then do we pay for a full optimization.
 
-        - If it improved meaningfully  -> keep the growth, it was worth it.
-          Immediately try growing again (test the next excitation).
-        - If it barely improved at all -> that excitation didn't help.
-          Roll back to the smaller circuit (and its already-optimized
-          parameters) and STOP. That smaller circuit is your final answer.
-
-    This is the actual "win" condition: finding the ground state with fewer
-    excitations than the full UCCSD circuit, instead of always building the
-    whole thing. It mirrors the spirit of ADAPT-VQE (grow only what
-    measurably helps), just with a fixed excitation ordering instead of
-    ADAPT-VQE's gradient-based operator selection.
+    If every remaining candidate's gradient magnitude is below
+    `gradient_threshold`, none of them would move the energy in any
+    meaningful direction from here -- that's the ADAPT-VQE convergence
+    criterion (max gradient < threshold), and the manager stops. That is
+    the "win" condition: a smaller-than-full-UCCSD circuit, arrived at
+    because nothing left in the pool actually helps, not because a fixed
+    ordering ran out.
 
     Whenever the ansatz *is* grown, previously-optimized parameters are
     carried over unchanged (warm start); only the newly added parameter(s)
     get fresh small-random or zero initial values.
 
 This module owns:
-    - the excitation pool (generated once, in a fixed order: singles first,
-      then doubles)
+    - the excitation pool (generated once; screened in arbitrary order --
+      the pool ordering no longer matters, since every candidate is
+      screened every round)
     - the "how much of the pool is currently active" state
     - plateau detection
-    - the grow/judge/rollback decision logic
+    - gradient-based candidate screening and the grow/stop decision
     - parameter inheritance across growth steps
 
 This module does NOT own:
     - the Hamiltonian / qubit mapper construction (inject a mapper)
     - the classical optimizer (SPSA, COBYLA, etc. -- lives in your VQE driver)
-    - the Estimator / energy evaluation
+    - the Estimator itself -- but it DOES need a way to ask for an energy
+      at an arbitrary circuit/parameter vector, purely for the cheap
+      gradient screen (2 evals per candidate, no optimization). That's
+      the `energy_evaluator` callable you pass in below.
 
 Typical usage
 -------------
@@ -51,9 +54,10 @@ Typical usage
         num_spatial_orbitals=4,
         num_particles=(2, 2),
         qubit_mapper=JordanWignerMapper(),
+        energy_evaluator=evaluate_energy,  # same fn you use in cost_fn below
         plateau_threshold=1e-4,     # "stopped improving" sensitivity
         plateau_patience=5,         # how many flat steps in a row = stuck
-        growth_benefit_threshold=1e-3,  # how big a drop counts as "worth it"
+        gradient_threshold=1e-3,    # ADAPT-VQE stopping criterion
     )
 
     while not manager.is_done:
@@ -64,7 +68,7 @@ Typical usage
             energy = evaluate_energy(circuit, x)          # your estimator call
             changed = manager.observe(energy, params=x)    # feed every eval
             if changed:
-                raise StopIteration   # ansatz just grew or rolled back+stopped
+                raise StopIteration   # ansatz just grew, or just stopped
             return energy
 
         try:
@@ -72,7 +76,7 @@ Typical usage
         except StopIteration:
             pass  # loop repeats (or exits, if manager.is_done is now True)
 
-    print(manager.summary())          # final circuit size + growth/rollback log
+    print(manager.summary())          # final circuit size + growth log
 
 See the `if __name__ == "__main__":` block at the bottom for a runnable,
 backend-agnostic structural test (no VQE needed) using a fake energy curve
@@ -84,7 +88,7 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 import numpy as np
 
@@ -184,54 +188,54 @@ def build_excitation_pool(
 # --------------------------------------------------------------------------
 
 @dataclass
-class _TrialState:
-    """Snapshot taken right before a trial growth, so we can either keep
-    going from here or roll all the way back to it."""
-    pre_active_indices: List[int]
-    pre_parameters: np.ndarray
-    pre_settled_energy: float
-    added_excitations: List[Excitation]
-    candidate_indices: List[int]
-
-
-@dataclass
 class GrowthEvent:
-    """Record of one grow-and-judge decision, useful for logging / paper
-    write-ups (shows exactly what was tried, and whether it was kept)."""
+    """Record of one gradient-screening decision, useful for logging / paper
+    write-ups (shows exactly what was screened-in, with what gradient, or
+    that nothing cleared the threshold and the manager stopped)."""
     added_excitations: List[Excitation]
+    gradient_magnitude: float
     num_active_before: int
     num_active_after: int
-    energy_before: float
-    energy_after: float
-    accepted: bool
+    energy_before_growth: float
+    stopped: bool = False
 
 
 class AdaptiveAnsatzManager:
     """Owns the growable UCC ansatz, the plateau-detection rule, the
-    grow/judge/rollback decision, and parameter warm-starting.
+    gradient-based grow/stop decision, and parameter warm-starting.
 
     Parameters
     ----------
     num_spatial_orbitals, num_particles, qubit_mapper :
         Same meaning as for qiskit-nature's UCC. Passed straight through.
+    energy_evaluator : Callable[[circuit, params], float]
+        Used ONLY for the cheap gradient screen: given a trial circuit and
+        a parameter vector, return its energy. The same function you
+        already call in your VQE cost function works here -- pass it in.
+        Each plateau costs `2 * len(remaining_pool)` calls to this (a
+        forward/backward finite difference per remaining candidate), which
+        is what replaces paying for a full optimization on every candidate.
     plateau_threshold : float
         |E_i - E_{i-1}| below this counts as "not improving" between
         consecutive evaluations -- used to detect that the *current* stage
-        has settled (converged for now), not whether growing was worth it.
+        has settled (converged for now).
     plateau_patience : int
         Number of consecutive non-improving steps required before treating
         the current stage as settled.
-    growth_benefit_threshold : float
-        After growing, the new stage's settled energy is compared to the
-        settled energy right before growth. If it dropped by at least this
-        much, the growth is kept. If not, it's rolled back and the manager
-        stops (this is the "smaller than full UCCSD" win condition). This
-        is deliberately a separate, usually larger, tolerance from
-        `plateau_threshold` -- plateau_threshold answers "has this stage
-        stopped moving", growth_benefit_threshold answers "was growing
-        actually worth the extra parameter".
+    gradient_threshold : float
+        The ADAPT-VQE stopping criterion. Once the largest |gradient|
+        among all remaining candidates falls below this, nothing left in
+        the pool would move the energy in any meaningful direction, so the
+        manager stops. This is what gives you a smaller-than-full-UCCSD
+        circuit instead of always exhausting the whole pool.
+    gradient_eps : float
+        Step size for the finite-difference gradient estimate (evaluated
+        at +eps and -eps around the candidate's parameter, which is
+        otherwise held at 0, with all other parameters fixed at their
+        current optimized values).
     growth_batch_size : int
-        How many new excitations to add from the pool per growth trial.
+        How many of the highest-gradient candidates (that clear
+        `gradient_threshold`) to add per growth step.
     new_param_init : {"zeros", "small_random"}
         How to initialize newly added parameters.
     new_param_std : float
@@ -248,15 +252,16 @@ class AdaptiveAnsatzManager:
         num_spatial_orbitals: int,
         num_particles: Tuple[int, int],
         qubit_mapper: QubitMapper,
+        energy_evaluator: Callable[[Any, np.ndarray], float],
         plateau_threshold: float = 1e-4,
         plateau_patience: int = 5,
-        growth_benefit_threshold: float = 1e-3,
+        gradient_threshold: float = 1e-3,
+        gradient_eps: float = 1e-2,
         growth_batch_size: int = 1,
         new_param_init: str = "small_random",
         new_param_std: float = 0.01,
         seed: Optional[int] = None,
         start_with_singles_only: bool = True,
-        rollback_patience: int = 2,
     ):
         if new_param_init not in ("zeros", "small_random"):
             raise ValueError("new_param_init must be 'zeros' or 'small_random'")
@@ -264,22 +269,15 @@ class AdaptiveAnsatzManager:
         self.num_spatial_orbitals = num_spatial_orbitals
         self.num_particles = num_particles
         self.qubit_mapper = qubit_mapper
+        self.energy_evaluator = energy_evaluator
 
         self.plateau_threshold = plateau_threshold
         self.plateau_patience = plateau_patience
-        self.growth_benefit_threshold = growth_benefit_threshold
+        self.gradient_threshold = gradient_threshold
+        self.gradient_eps = gradient_eps
         self.growth_batch_size = growth_batch_size
         self.new_param_init = new_param_init
         self.new_param_std = new_param_std
-        # Fix #3: a single unhelpful excitation no longer ends growth
-        # immediately. We revert it, permanently mark it as "tried and
-        # skipped", and give the *next* candidate in the pool a chance.
-        # Only after `rollback_patience` consecutive misses in a row do we
-        # actually stop. This matters because the pool's fixed singles-then-
-        # doubles ordering is somewhat arbitrary -- one low-value excitation
-        # showing up early in that order shouldn't be allowed to veto every
-        # excitation that comes after it.
-        self.rollback_patience = rollback_patience
         self._rng = np.random.default_rng(seed)
 
         self.pool, self._num_singles = build_excitation_pool(num_spatial_orbitals, num_particles)
@@ -292,12 +290,11 @@ class AdaptiveAnsatzManager:
         initial_count = max(1, min(initial_count, len(self.pool)))
 
         # `active_indices` are the pool positions currently included in the
-        # ansatz, in the order they were added (not necessarily a contiguous
-        # prefix once skips happen). `_next_candidate` is the pointer into
-        # the pool for the next excitation to consider trying.
+        # ansatz. Unlike the old fixed-order scheme, there's no pointer
+        # into the pool any more -- every remaining index is re-screened
+        # by gradient at every plateau, so membership in `active_indices`
+        # is the only state that matters.
         self.active_indices: List[int] = list(range(initial_count))
-        self._next_candidate: int = initial_count
-        self._consecutive_misses: int = 0
 
         self.parameters: np.ndarray = (
             np.zeros(len(self.active_indices))
@@ -311,7 +308,6 @@ class AdaptiveAnsatzManager:
         # detection of the *current* stage only.
         self._stage_history: List[float] = []
 
-        self._trial: Optional[_TrialState] = None
         self._done: bool = False
 
         self.growth_log: List[GrowthEvent] = []
@@ -328,8 +324,12 @@ class AdaptiveAnsatzManager:
     def num_active(self) -> int:
         return len(self.active_indices)
 
-    def _rebuild_ansatz(self) -> None:
-        active = [self.pool[i] for i in self.active_indices]
+    def _build_ucc_for_indices(self, indices: List[int]) -> UCC:
+        """Build a UCC circuit for an arbitrary set of pool indices. Shared
+        by `_rebuild_ansatz` (the real, committed ansatz) and the gradient
+        screen (throwaway trial circuits, one per candidate, never stored
+        on `self`)."""
+        active = [self.pool[i] for i in indices]
 
         from qiskit_nature.second_q.circuit.library import HartreeFock
 
@@ -338,13 +338,16 @@ class AdaptiveAnsatzManager:
         def excitation_fn(num_spatial_orbitals, num_particles, _active=active):
             return _active
 
-        self.ansatz = UCC(
+        return UCC(
             num_spatial_orbitals=self.num_spatial_orbitals,
             num_particles=self.num_particles,
             qubit_mapper=self.qubit_mapper,
             excitations=excitation_fn,
             initial_state=hf_state,
         )
+
+    def _rebuild_ansatz(self) -> None:
+        self.ansatz = self._build_ucc_for_indices(self.active_indices)
 
         if self.ansatz.num_parameters != self.num_active:
             raise RuntimeError(
@@ -368,17 +371,16 @@ class AdaptiveAnsatzManager:
 
     @property
     def is_fully_grown(self) -> bool:
-        """True once every excitation in the pool has been tried (accepted
-        or permanently skipped after rejection) -- not just when the active
-        set happens to equal the pool size, since skipped rejects mean
-        those two numbers can differ."""
-        return self._next_candidate >= len(self.pool)
+        """True once every excitation in the pool is active -- there's
+        nothing left to screen."""
+        return self.num_active >= len(self.pool)
 
     @property
     def is_done(self) -> bool:
-        """True once the manager has decided to stop -- either because a
-        growth trial didn't help and was rolled back, or because the full
-        pool was used and even that final stage plateaued."""
+        """True once the manager has decided to stop -- either because no
+        remaining candidate's gradient cleared `gradient_threshold`, or
+        because the full pool is active and even that final stage
+        plateaued."""
         return self._done
 
     # ----------------------------------------------------------------
@@ -410,10 +412,10 @@ class AdaptiveAnsatzManager:
         Returns
         -------
         changed : bool
-            True if the ansatz just grew, OR just rolled back and finished.
-            Either way, the circuit under your optimizer is no longer the
-            same object it was a moment ago (different size, or reverted
-            parameters) -- stop the current optimizer run. Check
+            True if the ansatz just grew, OR just stopped (no remaining
+            candidate cleared `gradient_threshold`). Either way, the
+            circuit under your optimizer is no longer the same object it
+            was a moment ago -- stop the current optimizer run. Check
             `manager.is_done` next: if True, you're finished; if False,
             start a fresh optimizer run on `manager.circuit` /
             `manager.initial_point`.
@@ -430,17 +432,7 @@ class AdaptiveAnsatzManager:
             return False
 
         settled_energy = self._settled_energy(self._stage_history)
-
-        if self._trial is not None:
-            return self._judge_trial(settled_energy)
-
-        # First plateau ever with no trial pending: try to grow.
-        if self.is_fully_grown:
-            self._done = True
-            return False
-
-        self._start_trial(settled_energy)
-        return True
+        return self._grow_or_stop(settled_energy)
 
     def finalize_stage(self, final_energy: float, final_params: np.ndarray) -> bool:
         """Convenience for optimizers that don't expose a per-iteration
@@ -458,88 +450,87 @@ class AdaptiveAnsatzManager:
         return changed
 
     # ----------------------------------------------------------------
-    # Internal: trial growth / judgement / rollback
+    # Internal: gradient screening + grow/stop decision
     # ----------------------------------------------------------------
 
-    def _start_trial(self, pre_settled_energy: float) -> None:
-        add_n = min(self.growth_batch_size, len(self.pool) - self._next_candidate)
-        candidate_indices = list(range(self._next_candidate, self._next_candidate + add_n))
-        added = [self.pool[i] for i in candidate_indices]
+    def _candidate_gradient(self, candidate_index: int) -> float:
+        """Cheap 2-eval finite-difference estimate of dE/dtheta for one
+        candidate excitation, at the current optimized parameters, with
+        the candidate's own parameter fixed at 0. No optimizer run."""
+        trial_indices = self.active_indices + [candidate_index]
+        trial_circuit = self._build_ucc_for_indices(trial_indices)
 
-        self._trial = _TrialState(
-            pre_active_indices=list(self.active_indices),
-            pre_parameters=self.parameters.copy(),
-            pre_settled_energy=pre_settled_energy,
-            added_excitations=added,
-            candidate_indices=candidate_indices,
-        )
+        base = self.parameters
+        plus = np.concatenate([base, [self.gradient_eps]])
+        minus = np.concatenate([base, [-self.gradient_eps]])
 
-        self.active_indices = self.active_indices + candidate_indices
+        e_plus = self.energy_evaluator(trial_circuit, plus)
+        e_minus = self.energy_evaluator(trial_circuit, minus)
+        return (e_plus - e_minus) / (2.0 * self.gradient_eps)
+
+    def _screen_remaining_candidates(self) -> List[Tuple[int, float]]:
+        """Returns [(pool_index, |gradient|), ...] for every excitation not
+        yet active, sorted by |gradient| descending."""
+        active_set = set(self.active_indices)
+        remaining = [i for i in range(len(self.pool)) if i not in active_set]
+        scored = [(i, abs(self._candidate_gradient(i))) for i in remaining]
+        scored.sort(key=lambda pair: pair[1], reverse=True)
+        return scored
+
+    def _grow_or_stop(self, settled_energy: float) -> bool:
+        """Called once a stage has plateaued. Screens every remaining pool
+        candidate by gradient (cheap), and either commits the
+        highest-gradient one(s) and starts a fresh optimization, or -- if
+        nothing clears `gradient_threshold` -- stops here. Returns True in
+        both cases (the circuit/state changed one way or the other)."""
+        if self.is_fully_grown:
+            self._done = True
+            return False
+
+        scored = self._screen_remaining_candidates()
+        winners = [(i, g) for i, g in scored if g >= self.gradient_threshold][: self.growth_batch_size]
+
+        if not winners:
+            best_grad = scored[0][1] if scored else 0.0
+            self.growth_log.append(
+                GrowthEvent(
+                    added_excitations=[],
+                    gradient_magnitude=best_grad,
+                    num_active_before=self.num_active,
+                    num_active_after=self.num_active,
+                    energy_before_growth=settled_energy,
+                    stopped=True,
+                )
+            )
+            self._done = True
+            return True
+
+        winner_indices = [i for i, _ in winners]
+        added = [self.pool[i] for i in winner_indices]
+        pre_num_active = self.num_active
+
+        self.active_indices = self.active_indices + winner_indices
         self._rebuild_ansatz()
 
         new_params = (
-            np.zeros(add_n)
+            np.zeros(len(winner_indices))
             if self.new_param_init == "zeros"
-            else self._rng.normal(0.0, self.new_param_std, add_n)
+            else self._rng.normal(0.0, self.new_param_std, len(winner_indices))
         )
-        self.parameters = np.concatenate([self._trial.pre_parameters, new_params])
+        self.parameters = np.concatenate([self.parameters, new_params])
         self._stage_history = []
+        self.stage += 1
 
-    def _judge_trial(self, settled_energy: float) -> bool:
-        trial = self._trial
-        improvement = trial.pre_settled_energy - settled_energy  # positive = got lower (better)
-
-        if improvement >= self.growth_benefit_threshold:
-            # Worth it: keep the growth, log acceptance, try growing further.
-            self.growth_log.append(
-                GrowthEvent(
-                    added_excitations=trial.added_excitations,
-                    num_active_before=len(trial.pre_active_indices),
-                    num_active_after=self.num_active,
-                    energy_before=trial.pre_settled_energy,
-                    energy_after=settled_energy,
-                    accepted=True,
-                )
-            )
-            self._next_candidate += len(trial.candidate_indices)
-            self._consecutive_misses = 0
-            self.stage += 1
-            self._trial = None
-
-            if self.is_fully_grown:
-                self._done = True
-                return False
-
-            self._start_trial(settled_energy)
-            return True
-
-        # Not worth it: revert this excitation and permanently skip it (it
-        # stays out of active_indices for good), but don't necessarily stop
-        # here -- give the next candidate(s) in the pool a chance first
-        # (Fix #3). Only after `rollback_patience` consecutive misses do we
-        # actually give up and finish on the last known-good ansatz.
         self.growth_log.append(
             GrowthEvent(
-                added_excitations=trial.added_excitations,
-                num_active_before=len(trial.pre_active_indices),
-                num_active_after=len(trial.pre_active_indices),
-                energy_before=trial.pre_settled_energy,
-                energy_after=settled_energy,
-                accepted=False,
+                added_excitations=added,
+                gradient_magnitude=winners[0][1],
+                num_active_before=pre_num_active,
+                num_active_after=self.num_active,
+                energy_before_growth=settled_energy,
+                stopped=False,
             )
         )
-        self.active_indices = trial.pre_active_indices
-        self.parameters = trial.pre_parameters.copy()
-        self._next_candidate += len(trial.candidate_indices)
-        self._consecutive_misses += 1
-        self._trial = None
-        self._rebuild_ansatz()
-
-        if self._consecutive_misses < self.rollback_patience and not self.is_fully_grown:
-            self._start_trial(trial.pre_settled_energy)
-            return True
-
-        self._done = True
         return True
 
     # ----------------------------------------------------------------
@@ -553,15 +544,21 @@ class AdaptiveAnsatzManager:
             f"Final ansatz size: {self.num_active} / {len(self.pool)} excitations "
             f"({'full UCCSD' if self.is_fully_grown else 'smaller than full UCCSD'})",
             f"Total energy evaluations recorded: {len(self.full_energy_history)}",
-            "Growth trials:",
+            "Growth steps (gradient-screened):",
         ]
         for ev in self.growth_log:
-            verdict = "KEPT" if ev.accepted else "ROLLED BACK (stopped here)"
-            lines.append(
-                f"  {ev.num_active_before} -> {ev.num_active_after} params: "
-                f"E {ev.energy_before:.8f} -> {ev.energy_after:.8f} "
-                f"(Δ={ev.energy_before - ev.energy_after:.2e})  [{verdict}]"
-            )
+            if ev.stopped:
+                lines.append(
+                    f"  stopped at {ev.num_active_before} params: best remaining "
+                    f"|gradient|={ev.gradient_magnitude:.2e} < threshold  [STOPPED]"
+                )
+            else:
+                names = ", ".join(str(exc) for exc in ev.added_excitations)
+                lines.append(
+                    f"  {ev.num_active_before} -> {ev.num_active_after} params: "
+                    f"added {names} (|gradient|={ev.gradient_magnitude:.2e}), "
+                    f"settled E before growth = {ev.energy_before_growth:.8f}"
+                )
         return "\n".join(lines)
 
 
@@ -579,13 +576,43 @@ if __name__ == "__main__":
     from qiskit_nature.second_q.mappers import JordanWignerMapper
 
     mapper = JordanWignerMapper()
+
+    # True energy as a function of how many excitations are active: drops
+    # fast at first, then genuinely saturates (extra excitations stop
+    # mattering) around 6 doubles beyond the singles, well short of the
+    # full pool. Defined before the manager since the fake evaluator below
+    # (used for gradient screening) needs it.
+    def true_energy(num_active: int, num_singles: int) -> float:
+        # doubles added so far, but capped at 6: beyond that point extra
+        # excitations contribute nothing at all (true saturation), so the
+        # manager MUST detect this via a near-zero gradient and stop
+        # instead of using them.
+        k = min(max(num_active - num_singles, 0), 6)
+        return -1.0 - 3.0 * (1 - np.exp(-0.35 * k))
+
+    def fake_energy_evaluator(circuit, params: np.ndarray) -> float:
+        """Stands in for a real Estimator call during the gradient screen.
+        `params` is [existing optimized params..., candidate_theta]. Builds
+        a toy energy surface whose central-difference gradient in
+        candidate_theta exactly equals `true_energy(k) - true_energy(k+1)`
+        -- i.e. it reproduces, via finite differences, how much adding one
+        more excitation would actually lower the true energy curve above,
+        including saturating to ~0 once the curve flattens."""
+        k = len(params) - 1  # active excitations before this candidate
+        e_low = true_energy(k, manager._num_singles)
+        e_high = true_energy(k + 1, manager._num_singles)
+        slope = e_low - e_high
+        theta_new = params[-1]
+        return e_low - slope * np.sin(theta_new)
+
     manager = AdaptiveAnsatzManager(
         num_spatial_orbitals=4,
         num_particles=(2, 2),
         qubit_mapper=mapper,
+        energy_evaluator=fake_energy_evaluator,
         plateau_threshold=1e-4,
         plateau_patience=5,
-        growth_benefit_threshold=1e-3,
+        gradient_threshold=1e-3,
         growth_batch_size=1,
         new_param_init="small_random",
         seed=42,
@@ -595,22 +622,12 @@ if __name__ == "__main__":
     print(f"(starting active excitations: {manager.num_active} out of {len(manager.pool)})")
     print()
 
-    # True energy as a function of how many excitations are active: drops
-    # fast at first, then genuinely saturates (extra excitations stop
-    # mattering) around num_active ~= 14, well short of the full pool (26).
-    def true_energy(num_active: int) -> float:
-        # doubles added so far, but capped at 6: beyond that point extra
-        # excitations contribute nothing at all (true saturation), so the
-        # manager MUST detect this and roll back instead of using them.
-        k = min(max(num_active - manager._num_singles, 0), 6)
-        return -1.0 - 3.0 * (1 - np.exp(-0.35 * k))
-
     step = 0
     max_steps = 5000
     while not manager.is_done and step < max_steps:
         step += 1
         stage_age = len(manager._stage_history)
-        target = true_energy(manager.num_active)
+        target = true_energy(manager.num_active, manager._num_singles)
         # simulate the optimizer converging toward `target` within the
         # stage, plus a little numerical noise
         prev_energy = manager.full_energy_history[-1] if manager.full_energy_history else -1.0
@@ -618,21 +635,24 @@ if __name__ == "__main__":
         fake_energy += manager._rng.normal(0, 1e-6)
         fake_params = manager.parameters + 1e-4
 
-        prev_active = manager.num_active
         prev_log_len = len(manager.growth_log)
         changed = manager.observe(fake_energy, params=fake_params)
 
         if changed and len(manager.growth_log) > prev_log_len:
-            # a trial was judged this step (grown-and-kept, or rolled back)
             last = manager.growth_log[-1]
-            tag = "KEPT" if last.accepted else "ROLLED BACK / STOPPED"
-            print(
-                f"step {step:4d}: trial {last.num_active_before}->{last.num_active_after} "
-                f"params, E {last.energy_before:.6f} -> {last.energy_after:.6f}  [{tag}]"
-            )
-        elif changed:
-            # a new trial just started (plateau detected, growing to test it)
-            print(f"step {step:4d}: plateaued at {prev_active} params -- starting growth trial")
+            if last.stopped:
+                print(
+                    f"step {step:4d}: stopped at {last.num_active_before} params "
+                    f"-- best remaining |gradient|={last.gradient_magnitude:.2e} "
+                    f"< threshold  [STOPPED]"
+                )
+            else:
+                print(
+                    f"step {step:4d}: plateaued at {last.num_active_before} params -- "
+                    f"gradient screen picked {last.added_excitations}, "
+                    f"|gradient|={last.gradient_magnitude:.2e}  [GREW to "
+                    f"{last.num_active_after}]"
+                )
 
     print()
     print("Final state:")
