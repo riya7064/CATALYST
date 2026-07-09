@@ -380,8 +380,7 @@ def run_learned_adaptive_ansatz(
     budget_growth_per_param: int = 8,
     plateau_threshold: float = 1e-5,
     plateau_patience: int = 4,
-    growth_benefit_threshold: float = 1e-4,
-    rollback_patience: int = 2,
+    gradient_threshold: float = 1e-4,
     max_stages: int = 25,
 ):
     """Run the learned ansatz growth loop and return the final circuit plus logs.
@@ -390,27 +389,34 @@ def run_learned_adaptive_ansatz(
         the very first (smallest) stage.
     budget_growth_per_param : Fix #2 -- extra evals granted *per currently-
         active parameter*, added on top of the base budget. Bigger ansatzes
-        get proportionally more room to actually converge before a growth
-        decision is judged, instead of every stage -- big or small --
+        get proportionally more room to actually converge before the next
+        growth decision, instead of every stage -- big or small --
         competing for the same fixed budget.
-    rollback_patience : forwarded to AdaptiveAnsatzManager (Fix #3) -- how
-        many consecutive unhelpful excitations in a row are tolerated
-        before growth actually stops.
+    gradient_threshold : forwarded to AdaptiveAnsatzManager -- the
+        ADAPT-VQE stopping criterion. Once every remaining excitation's
+        screened |gradient| falls below this, growth stops.
     """
+    # Used both for the real per-stage optimization (via ObservingCostFunction
+    # below) and, here, as the manager's `energy_evaluator` for its cheap
+    # gradient screen (2 evals per remaining candidate, no optimization).
+    estimator = StatevectorEstimator()
+
+    def energy_evaluator(circuit, params: np.ndarray) -> float:
+        return float(estimator.run([(circuit, qubit_op, params)]).result()[0].data.evs)
+
     manager = AdaptiveAnsatzManager(
         num_spatial_orbitals=problem.num_spatial_orbitals,
         num_particles=problem.num_particles,
         qubit_mapper=mapper,
+        energy_evaluator=energy_evaluator,
         plateau_threshold=plateau_threshold,
         plateau_patience=plateau_patience,
-        growth_benefit_threshold=growth_benefit_threshold,
+        gradient_threshold=gradient_threshold,
         growth_batch_size=1,
         new_param_init="small_random",
         seed=42,
-        rollback_patience=rollback_patience,
     )
 
-    estimator = StatevectorEstimator()
     shared_history = OptimizationHistory()
     stage_log = []
     t0 = time.time()
@@ -520,7 +526,7 @@ def run_adaptive_pipeline(
     mapping: str = "jordan_wigner",
     stage_budget: int = 50,
     budget_growth_per_param: int = 8,
-    rollback_patience: int = 2,
+    gradient_threshold: float = 1e-4,
 ):
     """Run the adaptive 4A-4D pipeline for a selected molecule."""
     driver = build_driver_for_molecule(molecule_name)
@@ -540,7 +546,7 @@ def run_adaptive_pipeline(
         qubit_op,
         total_budget_per_stage=stage_budget,
         budget_growth_per_param=budget_growth_per_param,
-        rollback_patience=rollback_patience,
+        gradient_threshold=gradient_threshold,
     )
 
     final_energy_electronic = grow_result["final_energy"]
