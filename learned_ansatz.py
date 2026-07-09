@@ -6,16 +6,19 @@ Adaptive UCCSD ansatz builder for VQE.
 Strategy (ADAPT-VQE: gradient-screened growth):
 
     Start with a singles-only UCC ansatz and optimize. When the
-    optimization on the current circuit plateaus (energy stops improving
-    for several consecutive evaluations), decide what to grow by
-    screening -- not by trial-and-optimize.
+    optimization on the current circuit plateaus (the *best-so-far*
+    energy stops improving for several consecutive evaluations, after a
+    minimum number of evaluations for this stage has elapsed), decide
+    what to grow by screening -- not by trial-and-optimize.
 
     Screening means: for every excitation still outside the ansatz,
     compute a cheap energy gradient at the *current* optimized parameters
     with the candidate's own parameter fixed at 0 (a 2-point finite
     difference, no optimizer run). Whichever candidate(s) have the largest
     |gradient| are the ones actually worth paying for, so only those get
-    added, and only then do we pay for a full optimization.
+    added, and only then do we pay for a full optimization. All of these
+    2 * len(remaining_candidates) screening evaluations for one round are
+    batched into a single call to `energy_evaluator`.
 
     If every remaining candidate's gradient magnitude is below
     `gradient_threshold`, none of them would move the energy in any
@@ -34,7 +37,7 @@ This module owns:
       the pool ordering no longer matters, since every candidate is
       screened every round)
     - the "how much of the pool is currently active" state
-    - plateau detection
+    - plateau detection (best-so-far, with a minimum-evals floor)
     - gradient-based candidate screening and the grow/stop decision
     - parameter inheritance across growth steps
 
@@ -42,22 +45,40 @@ This module does NOT own:
     - the Hamiltonian / qubit mapper construction (inject a mapper)
     - the classical optimizer (SPSA, COBYLA, etc. -- lives in your VQE driver)
     - the Estimator itself -- but it DOES need a way to ask for energies
-      at a batch of arbitrary circuit/parameter vectors, purely for the
-      cheap gradient screen (2 evals per remaining candidate, no
-      optimization, submitted as ONE batched call per screening round).
-      That's the `energy_evaluator` callable you pass in below.
+      at arbitrary circuit/parameter vectors, purely for the cheap
+      gradient screen. That's the `energy_evaluator` callable you pass in
+      below.
+
+energy_evaluator interface
+---------------------------
+    energy_evaluator(pairs: List[Tuple[circuit, params]]) -> List[float]
+
+    Batched: one call per screening round, covering every (circuit,
+    params) pair that round needs (2 per remaining candidate), instead of
+    one call per candidate. This matches the batched-Estimator-job design
+    used elsewhere in the pipeline (see vqe.py's `energy_evaluator`, which
+    packs every pair into a single `estimator.run(pubs)` job) -- so the
+    same function you already pass into `run_learned_adaptive_ansatz` in
+    vqe.py can be passed straight into this manager unchanged.
 
 Typical usage
 -------------
     from qiskit_nature.second_q.mappers import JordanWignerMapper
 
+    def energy_evaluator(pairs):
+        # pairs: List[(circuit, params)] -> List[float], ONE Estimator job
+        pubs = [(circuit, qubit_op, params) for circuit, params in pairs]
+        results = estimator.run(pubs).result()
+        return [float(r.data.evs) for r in results]
+
     manager = AdaptiveAnsatzManager(
         num_spatial_orbitals=4,
         num_particles=(2, 2),
         qubit_mapper=JordanWignerMapper(),
-        energy_evaluator=evaluate_energy,  # same fn you use in cost_fn below
-        plateau_threshold=1e-4,     # "stopped improving" sensitivity
-        plateau_patience=5,         # how many flat steps in a row = stuck
+        energy_evaluator=energy_evaluator,
+        plateau_threshold=1e-4,     # best-so-far improvement below this = flat
+        plateau_patience=5,         # window (in evals) checked for flatness
+        min_evals_per_stage=20,     # hard floor before a stage can plateau
         gradient_threshold=1e-3,    # ADAPT-VQE stopping criterion
     )
 
@@ -82,7 +103,8 @@ Typical usage
 See the `if __name__ == "__main__":` block at the bottom for a runnable,
 backend-agnostic structural test (no VQE needed) using a fake energy curve
 that intentionally saturates partway through the pool, to confirm the
-manager stops early with a smaller-than-full-UCCSD ansatz.
+manager stops early with a smaller-than-full-UCCSD ansatz -- and does so
+only once the stage has genuinely converged, not on a false-plateau blip.
 """
 
 from __future__ import annotations
@@ -210,22 +232,29 @@ class AdaptiveAnsatzManager:
     num_spatial_orbitals, num_particles, qubit_mapper :
         Same meaning as for qiskit-nature's UCC. Passed straight through.
     energy_evaluator : Callable[[List[Tuple[circuit, params]]], List[float]]
-        Used ONLY for the cheap gradient screen. Given a LIST of (circuit,
-        params) pairs, return a list of energies, one per pair, in the
-        same order -- i.e. it should submit them as one batched Estimator
-        call rather than looping one at a time. Each screening round builds
-        `2 * len(remaining_pool)` such pairs (a forward/backward finite
-        difference per remaining candidate) and passes them all through in
-        a single call, which is what replaces paying for a full
-        optimization on every candidate AND avoids per-call dispatch
-        overhead on top of that.
+        BATCHED. Called once per screening round with every (circuit,
+        params) pair that round needs -- 2 per remaining candidate (a
+        forward/backward finite-difference point) -- and must return one
+        float per pair, in the same order. This is what replaces paying
+        for a full optimization on every candidate, and it's meant to be
+        backed by a single Estimator job (see the module docstring).
     plateau_threshold : float
-        |E_i - E_{i-1}| below this counts as "not improving" between
-        consecutive evaluations -- used to detect that the *current* stage
-        has settled (converged for now).
+        How much the *best-so-far* energy must improve over the trailing
+        `plateau_patience` evaluations to still count as "improving".
+        Below this, the current stage is considered settled.
     plateau_patience : int
-        Number of consecutive non-improving steps required before treating
-        the current stage as settled.
+        Width (in evaluations) of the trailing window checked for
+        best-so-far improvement.
+    min_evals_per_stage : int
+        Hard floor: a stage cannot be declared plateaued until at least
+        this many evaluations have been observed for it, regardless of
+        how flat the trace looks. This exists because warm-started stages
+        only have one truly "live" (near-zero) parameter, and many
+        gradient-free optimizers (COBYLA in particular) spend their first
+        several evaluations building an initial simplex/trust region
+        before making real progress -- that early stretch can look flat
+        without the stage having converged. Tune this to comfortably
+        exceed your optimizer's typical "getting started" length.
     gradient_threshold : float
         The ADAPT-VQE stopping criterion. Once the largest |gradient|
         among all remaining candidates falls below this, nothing left in
@@ -236,7 +265,12 @@ class AdaptiveAnsatzManager:
         Step size for the finite-difference gradient estimate (evaluated
         at +eps and -eps around the candidate's parameter, which is
         otherwise held at 0, with all other parameters fixed at their
-        current optimized values).
+        current optimized values). If your energy_evaluator has any
+        sampling/shot noise in it, this needs to be large enough that the
+        finite difference isn't dominated by that noise -- a noisy
+        evaluator producing spuriously small gradients looks identical to
+        genuine ADAPT-VQE convergence, so err on the larger side (0.05-0.1)
+        unless you're on an exact statevector evaluator.
     growth_batch_size : int
         How many of the highest-gradient candidates (that clear
         `gradient_threshold`) to add per growth step.
@@ -256,9 +290,10 @@ class AdaptiveAnsatzManager:
         num_spatial_orbitals: int,
         num_particles: Tuple[int, int],
         qubit_mapper: QubitMapper,
-        energy_evaluator: Callable[[Any, np.ndarray], float],
+        energy_evaluator: Callable[[List[Tuple[Any, np.ndarray]]], List[float]],
         plateau_threshold: float = 1e-4,
         plateau_patience: int = 5,
+        min_evals_per_stage: int = 20,
         gradient_threshold: float = 1e-3,
         gradient_eps: float = 1e-2,
         growth_batch_size: int = 1,
@@ -269,6 +304,16 @@ class AdaptiveAnsatzManager:
     ):
         if new_param_init not in ("zeros", "small_random"):
             raise ValueError("new_param_init must be 'zeros' or 'small_random'")
+        if min_evals_per_stage < 2 * plateau_patience:
+            warnings.warn(
+                f"min_evals_per_stage={min_evals_per_stage} is smaller than "
+                f"2 * plateau_patience={2 * plateau_patience}. The best-so-far "
+                "plateau check needs at least 2*plateau_patience points to "
+                "compare a 'before' window against a 'recent' window, so the "
+                "effective floor will be max(min_evals_per_stage, "
+                "2*plateau_patience) regardless of what you set here.",
+                stacklevel=2,
+            )
 
         self.num_spatial_orbitals = num_spatial_orbitals
         self.num_particles = num_particles
@@ -277,6 +322,7 @@ class AdaptiveAnsatzManager:
 
         self.plateau_threshold = plateau_threshold
         self.plateau_patience = plateau_patience
+        self.min_evals_per_stage = min_evals_per_stage
         self.gradient_threshold = gradient_threshold
         self.gradient_eps = gradient_eps
         self.growth_batch_size = growth_batch_size
@@ -388,22 +434,40 @@ class AdaptiveAnsatzManager:
         return self._done
 
     # ----------------------------------------------------------------
-    # Plateau detection
+    # Plateau detection (best-so-far, with a minimum-evals floor)
     # ----------------------------------------------------------------
 
     def _has_plateaued(self, history: List[float]) -> bool:
-        if len(history) < self.plateau_patience + 1:
+        """A stage is settled once the *best* energy seen hasn't
+        meaningfully improved over the trailing `plateau_patience`
+        evaluations -- checked only after `min_evals_per_stage` evals have
+        happened at all.
+
+        This is immune to a handful of near-identical evaluations early in
+        an optimizer run (e.g. COBYLA building its initial simplex, or a
+        warm-started stage's one live parameter starting at ~0): those
+        make the *raw* trace look flat without the run having actually
+        converged, but they don't fool a best-so-far comparison, because
+        best-so-far only moves when something has genuinely improved.
+        """
+        effective_floor = max(self.min_evals_per_stage, 2 * self.plateau_patience)
+        if len(history) < effective_floor:
             return False
-        recent = history[-(self.plateau_patience + 1):]
-        deltas = [abs(recent[i + 1] - recent[i]) for i in range(len(recent) - 1)]
-        return all(d < self.plateau_threshold for d in deltas)
+
+        best = np.minimum.accumulate(np.asarray(history, dtype=float))
+        # Best value up through the window vs. best value within the
+        # trailing window: if the trailing window hasn't beaten what came
+        # before it by more than plateau_threshold, nothing's improving.
+        best_before = float(np.min(best[: -self.plateau_patience]))
+        best_recent = float(np.min(best[-self.plateau_patience:]))
+        return (best_before - best_recent) < self.plateau_threshold
 
     def _settled_energy(self, history: List[float]) -> float:
-        """The energy this stage has settled at, once plateaued: the mean
-        of the last `plateau_patience` values (smooths out noise better
-        than taking a single point)."""
-        window = history[-self.plateau_patience:]
-        return float(np.mean(window))
+        """The energy this stage has settled at, once plateaued: the best
+        (lowest) energy seen this stage -- not a mean, since a mean can be
+        pulled upward by early, still-converging evaluations that a
+        best-so-far view correctly discards."""
+        return float(np.min(np.asarray(history, dtype=float)))
 
     # ----------------------------------------------------------------
     # The main entry point: call this after every energy evaluation
@@ -449,67 +513,65 @@ class AdaptiveAnsatzManager:
         Same return-value meaning as `observe`.
         """
         changed = False
-        for _ in range(self.plateau_patience + 1):
+        floor = max(self.min_evals_per_stage, 2 * self.plateau_patience)
+        for _ in range(floor + 1):
             changed = self.observe(final_energy, params=final_params)
         return changed
 
     # ----------------------------------------------------------------
     # Internal: gradient screening + grow/stop decision
     # ----------------------------------------------------------------
+    #
+    # Both finite-difference points for every remaining candidate are
+    # packed into ONE call to `self.energy_evaluator` (batched), matching
+    # the `energy_evaluator(pairs: List[(circuit, params)]) -> List[float]`
+    # interface used by the rest of the pipeline (one Estimator job per
+    # screening round instead of one job per candidate per point).
 
     def _screen_remaining_candidates(self) -> List[Tuple[int, float]]:
         """Returns [(pool_index, |gradient|), ...] for every excitation not
-        yet active, sorted by |gradient| descending.
-
-        All candidates' plus/minus finite-difference evaluations are
-        submitted through `energy_evaluator` in ONE batched call instead of
-        `2 * len(remaining)` separate ones -- circuit construction still
-        happens per-candidate (that part is inherent to screening a bigger
-        pool), but the actual energy evaluations no longer pay per-call
-        overhead one at a time.
-        """
-        import time as _time
-
+        yet active, sorted by |gradient| descending. Costs exactly one
+        batched call to `energy_evaluator`, covering 2 * len(remaining)
+        (circuit, params) pairs."""
         active_set = set(self.active_indices)
         remaining = [i for i in range(len(self.pool)) if i not in active_set]
         if not remaining:
             return []
 
-        t0 = _time.time()
         base = self.parameters
         pairs: List[Tuple[Any, np.ndarray]] = []
-        for idx in remaining:
-            trial_indices = self.active_indices + [idx]
+        for candidate_index in remaining:
+            trial_indices = self.active_indices + [candidate_index]
             trial_circuit = self._build_ucc_for_indices(trial_indices)
             plus = np.concatenate([base, [self.gradient_eps]])
             minus = np.concatenate([base, [-self.gradient_eps]])
             pairs.append((trial_circuit, plus))
             pairs.append((trial_circuit, minus))
 
-        energies = self.energy_evaluator(pairs)  # <-- one batched call
+        energies = self.energy_evaluator(pairs)
+        if len(energies) != len(pairs):
+            raise RuntimeError(
+                f"energy_evaluator returned {len(energies)} energies for "
+                f"{len(pairs)} (circuit, params) pairs -- it must return "
+                "exactly one float per pair, in the same order."
+            )
 
-        scored = []
-        for k, idx in enumerate(remaining):
-            e_plus, e_minus = energies[2 * k], energies[2 * k + 1]
-            grad = (e_plus - e_minus) / (2.0 * self.gradient_eps)
-            scored.append((idx, abs(grad)))
+        scored: List[Tuple[int, float]] = []
+        for i, candidate_index in enumerate(remaining):
+            e_plus = energies[2 * i]
+            e_minus = energies[2 * i + 1]
+            gradient = (e_plus - e_minus) / (2.0 * self.gradient_eps)
+            scored.append((candidate_index, abs(gradient)))
+
         scored.sort(key=lambda pair: pair[1], reverse=True)
-
-        print(
-            f"  [screen] {len(remaining)} candidates, {len(pairs)} evals "
-            f"batched in {_time.time() - t0:.1f}s, best |grad|="
-            f"{scored[0][1]:.2e}" if scored else "  [screen] no candidates left",
-            flush=True,
-        )
         return scored
-
 
     def _grow_or_stop(self, settled_energy: float) -> bool:
         """Called once a stage has plateaued. Screens every remaining pool
-        candidate by gradient (cheap), and either commits the
-        highest-gradient one(s) and starts a fresh optimization, or -- if
-        nothing clears `gradient_threshold` -- stops here. Returns True in
-        both cases (the circuit/state changed one way or the other)."""
+        candidate by gradient (cheap, one batched call), and either commits
+        the highest-gradient one(s) and starts a fresh optimization, or --
+        if nothing clears `gradient_threshold` -- stops here. Returns True
+        in both cases (the circuit/state changed one way or the other)."""
         if self.is_fully_grown:
             self._done = True
             return False
@@ -596,7 +658,11 @@ class AdaptiveAnsatzManager:
 # Uses a fake energy model that genuinely saturates partway through the
 # pool (extra excitations beyond a certain point contribute ~0), so we can
 # confirm the manager stops EARLY with a smaller-than-full-UCCSD ansatz,
-# instead of always exhausting the whole pool.
+# instead of always exhausting the whole pool -- AND that it takes each
+# stage far enough to actually converge before deciding that (this is the
+# regression test for the false-plateau bug: the old raw-consecutive-delta
+# check would fire almost immediately on a warm-started, slowly-moving
+# parameter and stop with a tiny, under-optimized circuit).
 # --------------------------------------------------------------------------
 
 if __name__ == "__main__":
@@ -618,23 +684,24 @@ if __name__ == "__main__":
         return -1.0 - 3.0 * (1 - np.exp(-0.35 * k))
 
     def fake_energy_evaluator(pairs) -> List[float]:
-        """Stands in for a real (batched) Estimator call during the
-        gradient screen. Each `params` in `pairs` is [existing optimized
-        params..., candidate_theta]. Builds a toy energy surface whose
-        central-difference gradient in candidate_theta exactly equals
-        `true_energy(k) - true_energy(k+1)` -- i.e. it reproduces, via
-        finite differences, how much adding one more excitation would
-        actually lower the true energy curve above, including saturating
-        to ~0 once the curve flattens."""
-        results = []
+        """Stands in for a real batched Estimator call during the gradient
+        screen. `pairs` is a list of (circuit, params) where each `params`
+        is [existing optimized params..., candidate_theta]. Builds a toy
+        energy surface whose central-difference gradient in candidate_theta
+        exactly equals `true_energy(k) - true_energy(k+1)` -- i.e. it
+        reproduces, via finite differences, how much adding one more
+        excitation would actually lower the true energy curve above,
+        including saturating to ~0 once the curve flattens. Returns one
+        energy per pair, batched, matching the real pipeline's interface."""
+        out = []
         for _circuit, params in pairs:
             k = len(params) - 1  # active excitations before this candidate
             e_low = true_energy(k, manager._num_singles)
             e_high = true_energy(k + 1, manager._num_singles)
             slope = e_low - e_high
             theta_new = params[-1]
-            results.append(e_low - slope * np.sin(theta_new))
-        return results
+            out.append(e_low - slope * np.sin(theta_new))
+        return out
 
     manager = AdaptiveAnsatzManager(
         num_spatial_orbitals=4,
@@ -643,6 +710,7 @@ if __name__ == "__main__":
         energy_evaluator=fake_energy_evaluator,
         plateau_threshold=1e-4,
         plateau_patience=5,
+        min_evals_per_stage=20,
         gradient_threshold=1e-3,
         growth_batch_size=1,
         new_param_init="small_random",
@@ -660,9 +728,12 @@ if __name__ == "__main__":
         stage_age = len(manager._stage_history)
         target = true_energy(manager.num_active, manager._num_singles)
         # simulate the optimizer converging toward `target` within the
-        # stage, plus a little numerical noise
+        # stage, plus a little numerical noise. Deliberately slow (tau=8,
+        # not 4) so a false-plateau bug would trigger well before real
+        # convergence -- this is what makes the test actually discriminate
+        # between the old buggy detector and the fixed one.
         prev_energy = manager.full_energy_history[-1] if manager.full_energy_history else -1.0
-        fake_energy = target + (prev_energy - target) * np.exp(-stage_age / 4.0)
+        fake_energy = target + (prev_energy - target) * np.exp(-stage_age / 8.0)
         fake_energy += manager._rng.normal(0, 1e-6)
         fake_params = manager.parameters + 1e-4
 
@@ -671,6 +742,7 @@ if __name__ == "__main__":
 
         if changed and len(manager.growth_log) > prev_log_len:
             last = manager.growth_log[-1]
+            gap_to_target = abs(last.energy_before_growth - target)
             if last.stopped:
                 print(
                     f"step {step:4d}: stopped at {last.num_active_before} params "
@@ -679,10 +751,15 @@ if __name__ == "__main__":
                 )
             else:
                 print(
-                    f"step {step:4d}: plateaued at {last.num_active_before} params -- "
+                    f"step {step:4d}: plateaued at {last.num_active_before} params "
+                    f"(after {stage_age} evals, |E_settled - E_target|={gap_to_target:.2e}) -- "
                     f"gradient screen picked {last.added_excitations}, "
                     f"|gradient|={last.gradient_magnitude:.2e}  [GREW to "
                     f"{last.num_active_after}]"
+                )
+                assert gap_to_target < 1e-2, (
+                    "Stage was declared plateaued while still far from its true "
+                    "target energy -- the plateau detector is firing too early."
                 )
 
     print()
@@ -696,5 +773,6 @@ if __name__ == "__main__":
     assert manager.is_done
     print(
         f"\nStructural self-test PASSED: stopped at {manager.num_active}/{len(manager.pool)} "
-        "excitations -- smaller than the full UCCSD circuit, as intended."
+        "excitations -- smaller than the full UCCSD circuit, and each stage was "
+        "genuinely converged (not falsely plateaued) before growing."
     )
