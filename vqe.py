@@ -545,6 +545,8 @@ def run_adaptive_pipeline(
     budget_growth_per_param: int = 8,
     gradient_threshold: float = 1e-4,
     spsa_min_delta: float = 1e-4,
+    plateau_threshold: float = 1e-5,
+    plateau_patience: int = 4,
 ):
     """Run the adaptive 4A-4D pipeline for a selected molecule."""
     driver = build_driver_for_molecule(molecule_name)
@@ -566,6 +568,8 @@ def run_adaptive_pipeline(
         budget_growth_per_param=budget_growth_per_param,
         gradient_threshold=gradient_threshold,
         spsa_min_delta=spsa_min_delta,
+        plateau_threshold=plateau_threshold,
+        plateau_patience=plateau_patience,
     )
 
     final_energy_electronic = grow_result["final_energy"]
