@@ -594,7 +594,7 @@ if __name__ == "__main__":
     print("\n=== 4C adaptive controller: SPSA -> COBYLA (fallback: L-BFGS-B) ===")
     cost_fn = VQECostFunction(estimator, ansatz, qubit_op)
     adaptive = AdaptiveVQEOptimizer(
-        criterion=ConvergenceCriterion(patience=5, min_delta=1e-6, min_evals=10),
+        criterion=ConvergenceCriterion(patience=5, min_delta=1e-5, min_evals=10),
         fallback_name="lbfgsb",
     )
     report = adaptive.optimize(cost_fn, x0, total_budget=100)

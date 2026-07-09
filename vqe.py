@@ -430,6 +430,9 @@ def run_learned_adaptive_ansatz(
         stage_report = optimizer.optimize(cost_fn, x0, total_budget=stage_budget)
         # NOTE: no manager.finalize_stage() call anymore -- growth decisions
         # were already made live, inside cost_fn, via manager.observe().
+        print(f"[stage {step_guard}] n_active={manager.num_active} budget={stage_budget} "
+            f"total_evals_so_far={shared_history.n_evals} best_so_far={min(shared_history.energies):.6f}",
+            flush=True)
 
         stage_log.append(
             {
@@ -553,6 +556,7 @@ def run_adaptive_pipeline(
     full_ref = get_reference_energy(problem_full)
     reduced_ref = get_reference_energy(reduced_problem)
     final_depth = ansatz_stats(grow_result["final_circuit"])["transpiled_depth"]
+    
 
     return {
         "molecule": molecule_name,
