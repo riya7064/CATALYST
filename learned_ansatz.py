@@ -187,16 +187,11 @@ def build_excitation_pool(
 class _TrialState:
     """Snapshot taken right before a trial growth, so we can either keep
     going from here or roll all the way back to it."""
-    pre_num_active: int
+    pre_active_indices: List[int]
     pre_parameters: np.ndarray
     pre_settled_energy: float
     added_excitations: List[Excitation]
-    # How many consecutive "not worth it" verdicts this same trial has
-    # already received. Used by the confirm-before-rollback retry: a single
-    # under-converged stage can no longer kill growth permanently -- the
-    # negative verdict must repeat `rollback_confirmation_patience` times
-    # in a row before the manager actually rolls back and stops.
-    retries: int = 0
+    candidate_indices: List[int]
 
 
 @dataclass
@@ -209,79 +204,6 @@ class GrowthEvent:
     energy_before: float
     energy_after: float
     accepted: bool
-
-
-class AnsatzGrowthSignal(Exception):
-    """Raised by `GrowthObservingCostFunction` the instant `manager.observe()`
-    reports that the ansatz just grew or just rolled back+stopped.
-
-    Whatever optimizer is currently running (SPSA, COBYLA, ...) is, at that
-    moment, iterating on a circuit/parameter-vector that no longer matches
-    reality -- either the circuit just got bigger (new params appended) or
-    the parameters were just reverted to a smaller circuit's optimum. Either
-    way the in-flight `.minimize()` call must be unwound immediately rather
-    than continuing to evaluate a stale ansatz. This exception is how that
-    unwind happens: it propagates up out of the optimizer's `minimize()`
-    call so the outer growth loop can react (start a fresh stage, or stop).
-    """
-
-    def __init__(self, is_done: bool):
-        self.is_done = is_done
-        super().__init__(f"Ansatz changed mid-optimization (manager.is_done={is_done})")
-
-
-class GrowthObservingCostFunction:
-    """Wraps a VQE cost function so that *every single evaluation* -- not
-    just the final one at the end of a stage -- is fed to
-    `AdaptiveAnsatzManager.observe()`.
-
-    This replaces the old pattern of calling `manager.finalize_stage()`
-    once after the optimizer finishes: that fallback only ever sees the
-    stage's last (possibly unconverged) energy, so plateau/growth-benefit
-    decisions were being made on a single, potentially noisy point. Here,
-    the manager sees the true per-iteration trace and makes its plateau
-    and growth-benefit calls the way it was designed to -- on real
-    convergence behavior, not an artificially manufactured settled window.
-
-    Duck-types the same interface `AdaptiveVQEOptimizer` / qiskit optimizers
-    expect from a cost function (`__call__`, `.phase`, `.history`), so it
-    can be dropped in wherever a plain `VQECostFunction` was used.
-    """
-
-    def __init__(self, cost_fn, manager: "AdaptiveAnsatzManager") -> None:
-        self.cost_fn = cost_fn
-        self.manager = manager
-
-    @property
-    def history(self):
-        return self.cost_fn.history
-
-    @property
-    def phase(self) -> str:
-        return self.cost_fn.phase
-
-    @phase.setter
-    def phase(self, value: str) -> None:
-        self.cost_fn.phase = value
-
-    def __call__(self, params: np.ndarray) -> float:
-        params = np.asarray(params)
-
-        # Safety check: if the optimizer somehow hands us a parameter vector
-        # whose length no longer matches the current ansatz, abort immediately.
-        # This prevents Qiskit from trying to bind 8 parameters onto a
-        # 9-parameter circuit.
-        if params.size != self.manager.circuit.num_parameters:
-            raise AnsatzGrowthSignal(is_done=self.manager.is_done)
-
-        energy = self.cost_fn(params)
-
-        changed = self.manager.observe(energy, params=params)
-
-        if changed:
-            raise AnsatzGrowthSignal(is_done=self.manager.is_done)
-
-        return energy
 
 
 class AdaptiveAnsatzManager:
@@ -310,13 +232,6 @@ class AdaptiveAnsatzManager:
         actually worth the extra parameter".
     growth_batch_size : int
         How many new excitations to add from the pool per growth trial.
-    rollback_confirmation_patience : int
-        A "not worth it" verdict must repeat this many consecutive times
-        before the manager actually rolls back and stops. On a verdict
-        that isn't yet confirmed, the manager keeps the current (grown)
-        circuit and simply gives it another settling window instead of
-        discarding it -- so one under-converged stage can't permanently
-        end growth on its own.
     new_param_init : {"zeros", "small_random"}
         How to initialize newly added parameters.
     new_param_std : float
@@ -337,11 +252,11 @@ class AdaptiveAnsatzManager:
         plateau_patience: int = 5,
         growth_benefit_threshold: float = 1e-3,
         growth_batch_size: int = 1,
-        rollback_confirmation_patience: int = 2,
         new_param_init: str = "small_random",
         new_param_std: float = 0.01,
         seed: Optional[int] = None,
         start_with_singles_only: bool = True,
+        rollback_patience: int = 2,
     ):
         if new_param_init not in ("zeros", "small_random"):
             raise ValueError("new_param_init must be 'zeros' or 'small_random'")
@@ -354,24 +269,40 @@ class AdaptiveAnsatzManager:
         self.plateau_patience = plateau_patience
         self.growth_benefit_threshold = growth_benefit_threshold
         self.growth_batch_size = growth_batch_size
-        self.rollback_confirmation_patience = max(1, rollback_confirmation_patience)
         self.new_param_init = new_param_init
         self.new_param_std = new_param_std
+        # Fix #3: a single unhelpful excitation no longer ends growth
+        # immediately. We revert it, permanently mark it as "tried and
+        # skipped", and give the *next* candidate in the pool a chance.
+        # Only after `rollback_patience` consecutive misses in a row do we
+        # actually stop. This matters because the pool's fixed singles-then-
+        # doubles ordering is somewhat arbitrary -- one low-value excitation
+        # showing up early in that order shouldn't be allowed to veto every
+        # excitation that comes after it.
+        self.rollback_patience = rollback_patience
         self._rng = np.random.default_rng(seed)
 
         self.pool, self._num_singles = build_excitation_pool(num_spatial_orbitals, num_particles)
         if len(self.pool) == 0:
             raise RuntimeError("Excitation pool is empty -- check num_particles/orbitals.")
 
-        self.num_active = self._num_singles if start_with_singles_only else min(
+        initial_count = self._num_singles if start_with_singles_only else min(
             growth_batch_size, len(self.pool)
         )
-        self.num_active = max(1, min(self.num_active, len(self.pool)))
+        initial_count = max(1, min(initial_count, len(self.pool)))
+
+        # `active_indices` are the pool positions currently included in the
+        # ansatz, in the order they were added (not necessarily a contiguous
+        # prefix once skips happen). `_next_candidate` is the pointer into
+        # the pool for the next excitation to consider trying.
+        self.active_indices: List[int] = list(range(initial_count))
+        self._next_candidate: int = initial_count
+        self._consecutive_misses: int = 0
 
         self.parameters: np.ndarray = (
-            np.zeros(self.num_active)
+            np.zeros(len(self.active_indices))
             if new_param_init == "zeros"
-            else self._rng.normal(0.0, new_param_std, self.num_active)
+            else self._rng.normal(0.0, new_param_std, len(self.active_indices))
         )
 
         # Every energy ever observed, across all stages -- for plotting.
@@ -393,8 +324,12 @@ class AdaptiveAnsatzManager:
     # Circuit construction
     # ----------------------------------------------------------------
 
+    @property
+    def num_active(self) -> int:
+        return len(self.active_indices)
+
     def _rebuild_ansatz(self) -> None:
-        active = self.pool[: self.num_active]
+        active = [self.pool[i] for i in self.active_indices]
 
         from qiskit_nature.second_q.circuit.library import HartreeFock
 
@@ -433,7 +368,11 @@ class AdaptiveAnsatzManager:
 
     @property
     def is_fully_grown(self) -> bool:
-        return self.num_active >= len(self.pool)
+        """True once every excitation in the pool has been tried (accepted
+        or permanently skipped after rejection) -- not just when the active
+        set happens to equal the pool size, since skipped rejects mean
+        those two numbers can differ."""
+        return self._next_candidate >= len(self.pool)
 
     @property
     def is_done(self) -> bool:
@@ -482,14 +421,7 @@ class AdaptiveAnsatzManager:
         self.full_energy_history.append(energy)
         self._stage_history.append(energy)
         if params is not None:
-            params = np.asarray(params, dtype=float)
-
-            # Ignore stale parameter vectors that belong to the previous
-            # ansatz size. This can happen because some optimizers (notably
-            # SPSA in qiskit-algorithms 0.4.x) may perform one additional
-            # callback after the ansatz has already been grown.
-            if params.size == self.num_active:
-                self.parameters = params.copy()
+            self.parameters = np.asarray(params, dtype=float)
 
         if self._done:
             return False
@@ -530,17 +462,19 @@ class AdaptiveAnsatzManager:
     # ----------------------------------------------------------------
 
     def _start_trial(self, pre_settled_energy: float) -> None:
-        add_n = min(self.growth_batch_size, len(self.pool) - self.num_active)
-        added = self.pool[self.num_active: self.num_active + add_n]
+        add_n = min(self.growth_batch_size, len(self.pool) - self._next_candidate)
+        candidate_indices = list(range(self._next_candidate, self._next_candidate + add_n))
+        added = [self.pool[i] for i in candidate_indices]
 
         self._trial = _TrialState(
-            pre_num_active=self.num_active,
+            pre_active_indices=list(self.active_indices),
             pre_parameters=self.parameters.copy(),
             pre_settled_energy=pre_settled_energy,
-            added_excitations=list(added),
+            added_excitations=added,
+            candidate_indices=candidate_indices,
         )
 
-        self.num_active += add_n
+        self.active_indices = self.active_indices + candidate_indices
         self._rebuild_ansatz()
 
         new_params = (
@@ -557,19 +491,18 @@ class AdaptiveAnsatzManager:
 
         if improvement >= self.growth_benefit_threshold:
             # Worth it: keep the growth, log acceptance, try growing further.
-            # Any pending rollback confirmation is cleared -- a real
-            # improvement resets the "how many times in a row has this
-            # looked unhelpful" counter.
             self.growth_log.append(
                 GrowthEvent(
                     added_excitations=trial.added_excitations,
-                    num_active_before=trial.pre_num_active,
+                    num_active_before=len(trial.pre_active_indices),
                     num_active_after=self.num_active,
                     energy_before=trial.pre_settled_energy,
                     energy_after=settled_energy,
                     accepted=True,
                 )
             )
+            self._next_candidate += len(trial.candidate_indices)
+            self._consecutive_misses = 0
             self.stage += 1
             self._trial = None
 
@@ -580,35 +513,32 @@ class AdaptiveAnsatzManager:
             self._start_trial(settled_energy)
             return True
 
-        # Looked unhelpful this time. Don't act on a single unlucky,
-        # possibly under-converged verdict -- require it to repeat
-        # `rollback_confirmation_patience` times in a row first.
-        trial.retries += 1
-        if trial.retries < self.rollback_confirmation_patience:
-            # Give the same (already-grown) circuit another settling
-            # window before condemning it: keep the current ansatz size
-            # and parameters exactly as they are, just re-arm plateau
-            # detection so the optimizer keeps refining instead of being
-            # judged again on a trace that hasn't had time to converge.
-            self._stage_history = []
-            return False
-
-        # Confirmed `rollback_confirmation_patience` times in a row: roll
-        # back to the smaller circuit and stop for good.
+        # Not worth it: revert this excitation and permanently skip it (it
+        # stays out of active_indices for good), but don't necessarily stop
+        # here -- give the next candidate(s) in the pool a chance first
+        # (Fix #3). Only after `rollback_patience` consecutive misses do we
+        # actually give up and finish on the last known-good ansatz.
         self.growth_log.append(
             GrowthEvent(
                 added_excitations=trial.added_excitations,
-                num_active_before=trial.pre_num_active,
-                num_active_after=self.num_active,
+                num_active_before=len(trial.pre_active_indices),
+                num_active_after=len(trial.pre_active_indices),
                 energy_before=trial.pre_settled_energy,
                 energy_after=settled_energy,
                 accepted=False,
             )
         )
-        self.num_active = trial.pre_num_active
+        self.active_indices = trial.pre_active_indices
         self.parameters = trial.pre_parameters.copy()
-        self._rebuild_ansatz()
+        self._next_candidate += len(trial.candidate_indices)
+        self._consecutive_misses += 1
         self._trial = None
+        self._rebuild_ansatz()
+
+        if self._consecutive_misses < self.rollback_patience and not self.is_fully_grown:
+            self._start_trial(trial.pre_settled_energy)
+            return True
+
         self._done = True
         return True
 

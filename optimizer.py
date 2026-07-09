@@ -80,14 +80,23 @@ from qiskit_algorithms.optimizers import (
     GradientDescent,
 )
 
-# Raised by learned_ansatz.GrowthObservingCostFunction when the growth
-# manager grows or rolls back mid-optimization. This is a *signal*, not a
-# real optimizer failure, so it must never be swallowed by the generic
-# `except Exception` fallback below -- it needs to propagate all the way
-# out to the growth loop in vqe.py.
-from learned_ansatz import AnsatzGrowthSignal
-
 logger = logging.getLogger(__name__)
+
+
+class OptimizationInterrupted(Exception):
+    """A cost function can raise this to unwind the *current* optimizer
+    phase early -- e.g. an external controller (like learned_ansatz's
+    AdaptiveAnsatzManager) decided mid-run that the circuit being optimized
+    just grew or was rolled back, so the parameters/ansatz underneath the
+    optimizer are no longer the ones it thinks it's tuning.
+
+    AdaptiveVQEOptimizer.optimize() catches this itself and returns a
+    partial-but-valid OptimizationReport (built from whatever the shared
+    OptimizationHistory recorded up to the interruption) instead of letting
+    it propagate as a crash. This is what lets a growth manager interrupt
+    optimization *without* losing the phase/eval bookkeeping that reporting
+    and the notebook plots depend on.
+    """
 
 
 # ===========================================================================
@@ -345,14 +354,6 @@ class VQECostFunction:
         self._phase = value
 
     def __call__(self, params: np.ndarray) -> float:
-        params = np.asarray(params)
-
-        if params.size != self.ansatz.num_parameters:
-            raise RuntimeError(
-                f"Parameter mismatch: ansatz expects "
-                f"{self.ansatz.num_parameters} parameters, "
-                f"received {params.size}."
-            )
         job = self.estimator.run([(self.ansatz, self.hamiltonian, params)])
         energy = float(job.result()[0].data.evs)
         self.history.record(energy, params, phase=self._phase)
@@ -382,6 +383,7 @@ class OptimizationReport:
     energy_history: List[float]
     phases: List[PhaseRecord] = field(default_factory=list)
     switched_at_eval: Optional[int] = None
+    interrupted: bool = False
 
     def as_dict(self) -> Dict[str, Any]:
         d = self.__dict__.copy()
@@ -430,6 +432,8 @@ class AdaptiveVQEOptimizer:
         t0 = time.time()
         x_current = np.array(initial_point, copy=True)
         phases: List[PhaseRecord] = []
+        interrupted = False
+        result = None
 
         # ---- Phase 1: SPSA, monitored iteration-by-iteration ---- #
         cost_fn.phase = "spsa"
@@ -450,29 +454,29 @@ class AdaptiveVQEOptimizer:
             termination_checker=termination_checker,
             **self.spsa_kwargs,
         )
-
         try:
             result = spsa.minimize(fun=cost_fn, x0=x_current)
-        except AnsatzGrowthSignal:
-            # Normal event: the adaptive ansatz has grown (or rolled back).
-            # Abort this optimizer phase immediately and let the outer growth
-            # loop restart SPSA/COBYLA on the new circuit.
-            raise
+            x_current = result.x
+        except OptimizationInterrupted:
+            interrupted = True
 
-        x_current = result.x
-
-        spsa_iters_used = int(getattr(result, "nit", total_budget) or total_budget)
+        spsa_iters_used = (
+            int(getattr(result, "nit", total_budget) or total_budget)
+            if result is not None
+            else cost_fn.history.n_evals
+        )
         converged_early = switch_eval["value"] is not None
         switch_point = switch_eval["value"] if converged_early else cost_fn.history.n_evals
 
-        reason = (
-            "converged -> switching to COBYLA"
-            if converged_early
-            else "exhausted budget without switching"
-        )
+        if interrupted:
+            reason = "interrupted externally (ansatz grew/rolled back mid-phase)"
+        elif converged_early:
+            reason = "converged -> switching to COBYLA"
+        else:
+            reason = "exhausted budget without switching"
         phases.append(PhaseRecord("spsa", spsa_iters_used, reason))
 
-        remaining = max(total_budget - spsa_iters_used, 0) if converged_early else 0
+        remaining = 0 if interrupted else (max(total_budget - spsa_iters_used, 0) if converged_early else 0)
 
         # ---- Phase 2: COBYLA refinement, with L-BFGS-B fallback ---- #
         if remaining > 0:
@@ -483,25 +487,38 @@ class AdaptiveVQEOptimizer:
                 x_current = result.x
                 cobyla_iters = int(getattr(result, "nit", remaining) or remaining)
                 phases.append(PhaseRecord("cobyla", cobyla_iters, "refinement phase"))
-            except AnsatzGrowthSignal:
-                # Not a COBYLA failure -- the growth manager just changed
-                # the ansatz mid-run. Let it propagate to the growth loop.
-                raise
+            except OptimizationInterrupted:
+                interrupted = True
+                phases.append(PhaseRecord("cobyla", cost_fn.history.n_evals - switch_point, "interrupted externally"))
             except Exception as exc:
                 logger.warning("COBYLA phase failed (%s); falling back to %s", exc, self.fallback_name)
                 cost_fn.phase = self.fallback_name
-                fallback = OptimizerFactory.build(self.fallback_name, maxiter=remaining, **self.fallback_kwargs)
-                result = fallback.minimize(fun=cost_fn, x0=x_current)
-                x_current = result.x
-                fb_iters = int(getattr(result, "nit", remaining) or remaining)
-                phases.append(PhaseRecord(self.fallback_name, fb_iters, f"fallback after COBYLA error: {exc}"))
+                try:
+                    fallback = OptimizerFactory.build(self.fallback_name, maxiter=remaining, **self.fallback_kwargs)
+                    result = fallback.minimize(fun=cost_fn, x0=x_current)
+                    x_current = result.x
+                    fb_iters = int(getattr(result, "nit", remaining) or remaining)
+                    phases.append(PhaseRecord(self.fallback_name, fb_iters, f"fallback after COBYLA error: {exc}"))
+                except OptimizationInterrupted:
+                    interrupted = True
+                    phases.append(PhaseRecord(self.fallback_name, cost_fn.history.n_evals - switch_point, "interrupted externally"))
 
         runtime = time.time() - t0
         history = cost_fn.history
 
+        # On a clean finish, `result` holds the true optimizer-reported
+        # final point. On an interruption, trust the shared history instead
+        # -- it's exactly as current as the cost function itself.
+        if interrupted or result is None:
+            final_energy = float(history.energies[-1]) if history.energies else float("nan")
+            optimal_params = np.asarray(history.params[-1]) if history.params else x_current
+        else:
+            final_energy = float(result.fun)
+            optimal_params = result.x
+
         return OptimizationReport(
-            final_energy=float(result.fun),
-            optimal_params=result.x,
+            final_energy=final_energy,
+            optimal_params=optimal_params,
             num_iterations=sum(p.iterations for p in phases),
             num_function_evals=history.n_evals,
             runtime_sec=runtime,
@@ -509,6 +526,7 @@ class AdaptiveVQEOptimizer:
             energy_history=list(history.energies),
             phases=phases,
             switched_at_eval=switch_point,
+            interrupted=interrupted,
         )
 
 

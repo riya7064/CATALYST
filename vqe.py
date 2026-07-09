@@ -27,11 +27,12 @@ from hamiltonian import (
 )
 from active_space_reduction import auto_select_active_space, report_problem_size
 from ansatz import ansatz_stats, build_hartree_fock_state, get_ansatz
-from learned_ansatz import AdaptiveAnsatzManager, AnsatzGrowthSignal, GrowthObservingCostFunction
+from learned_ansatz import AdaptiveAnsatzManager
 from optimizer import (
     AdaptiveVQEOptimizer,
     ConvergenceCriterion,
     OptimizationHistory,
+    OptimizationInterrupted,
     SingleOptimizerRunner,
     VQECostFunction,
 )
@@ -347,13 +348,28 @@ def adaptive_select_active_space(problem, max_qubits: int = 8):
     return reduced, (n_occ, n_virt)
 
 
-def _stage_budget(base_budget: int, num_active: int, budget_scale_per_param: int) -> int:
-    """Scale the per-stage evaluation budget with ansatz size. Bigger stages
-    (more parameters, harder landscape) get proportionally more evals to
-    actually converge before their growth-benefit verdict is trusted,
-    instead of every stage sharing the same fixed budget regardless of
-    size."""
-    return base_budget + budget_scale_per_param * num_active
+class ObservingCostFunction(VQECostFunction):
+    """Fix #1: feeds every single energy evaluation to the growth manager
+    in real time, instead of only reporting once at stage-end (the old
+    `finalize_stage` fallback). This means plateau/growth decisions are
+    judged against the *true* optimization trace, not a single,
+    possibly-under-converged end point.
+
+    The instant the manager signals a change (ansatz grew, or a trial was
+    rolled back), this raises `OptimizationInterrupted` so the enclosing
+    `AdaptiveVQEOptimizer.optimize()` call unwinds cleanly (see optimizer.py)
+    instead of continuing to tune a circuit that's already stale.
+    """
+
+    def __init__(self, estimator, ansatz, hamiltonian, manager, history=None):
+        super().__init__(estimator, ansatz, hamiltonian, history=history)
+        self.manager = manager
+
+    def __call__(self, params: np.ndarray) -> float:
+        energy = super().__call__(params)
+        if self.manager.observe(energy, params=np.asarray(params, dtype=float)):
+            raise OptimizationInterrupted()
+        return energy
 
 
 def run_learned_adaptive_ansatz(
@@ -361,21 +377,25 @@ def run_learned_adaptive_ansatz(
     mapper,
     qubit_op,
     total_budget_per_stage: int = 80,
+    budget_growth_per_param: int = 8,
     plateau_threshold: float = 1e-5,
     plateau_patience: int = 4,
     growth_benefit_threshold: float = 1e-4,
-    rollback_confirmation_patience: int = 2,
-    budget_scale_per_param: int = 15,
+    rollback_patience: int = 2,
     max_stages: int = 25,
 ):
     """Run the learned ansatz growth loop and return the final circuit plus logs.
 
-    Every optimizer evaluation is fed to `manager.observe()` in real time
-    (via `GrowthObservingCostFunction`), so plateau detection and the
-    grow/keep/rollback verdict are based on the true convergence trace for
-    each stage -- not a single end-of-stage snapshot. `manager.finalize_stage()`
-    is only used as the documented fallback, for the rare case a stage
-    exhausts its whole budget without ever plateauing.
+    total_budget_per_stage : base per-stage evaluation budget, granted to
+        the very first (smallest) stage.
+    budget_growth_per_param : Fix #2 -- extra evals granted *per currently-
+        active parameter*, added on top of the base budget. Bigger ansatzes
+        get proportionally more room to actually converge before a growth
+        decision is judged, instead of every stage -- big or small --
+        competing for the same fixed budget.
+    rollback_patience : forwarded to AdaptiveAnsatzManager (Fix #3) -- how
+        many consecutive unhelpful excitations in a row are tolerated
+        before growth actually stops.
     """
     manager = AdaptiveAnsatzManager(
         num_spatial_orbitals=problem.num_spatial_orbitals,
@@ -385,9 +405,9 @@ def run_learned_adaptive_ansatz(
         plateau_patience=plateau_patience,
         growth_benefit_threshold=growth_benefit_threshold,
         growth_batch_size=1,
-        rollback_confirmation_patience=rollback_confirmation_patience,
         new_param_init="small_random",
         seed=42,
+        rollback_patience=rollback_patience,
     )
 
     estimator = StatevectorEstimator()
@@ -399,53 +419,47 @@ def run_learned_adaptive_ansatz(
     while not manager.is_done and step_guard < max_stages:
         step_guard += 1
         x0 = manager.initial_point
-        base_cost_fn = VQECostFunction(estimator, manager.circuit, qubit_op, history=shared_history)
-        base_cost_fn.phase = f"stage{manager.stage}(n={manager.num_active})"
-        cost_fn = GrowthObservingCostFunction(base_cost_fn, manager)
+        stage_budget = total_budget_per_stage + budget_growth_per_param * manager.num_active
 
-        stage_budget = _stage_budget(total_budget_per_stage, manager.num_active, budget_scale_per_param)
+        cost_fn = ObservingCostFunction(estimator, manager.circuit, qubit_op, manager, history=shared_history)
+        cost_fn.phase = f"stage{manager.stage}(n={manager.num_active})"
 
         optimizer = AdaptiveVQEOptimizer(
             criterion=ConvergenceCriterion(patience=5, min_delta=1e-7, min_evals=10)
         )
-
-        evals_before_stage = shared_history.n_evals
-        try:
-            stage_report = optimizer.optimize(cost_fn, x0, total_budget=stage_budget)
-            # Optimizer finished its whole budget without the manager ever
-            # signaling a plateau via observe() -- fall back to the
-            # documented (less precise) end-of-stage judgement so the
-            # growth loop still makes progress instead of stalling here.
-            manager.finalize_stage(stage_report.final_energy, stage_report.optimal_params)
-            final_energy_this_stage = stage_report.final_energy
-            phases_log = [(p.optimizer, p.iterations, p.reason) for p in stage_report.phases]
-            switched_at_eval = stage_report.switched_at_eval
-        except AnsatzGrowthSignal:
-            # The manager has already updated its circuit and parameter vector.
-            # Simply end this stage and let the outer while-loop restart using
-            # manager.initial_point.
-            final_energy_this_stage = manager.full_energy_history[-1]
-            phases_log = []
-            switched_at_eval = None
+        stage_report = optimizer.optimize(cost_fn, x0, total_budget=stage_budget)
+        # NOTE: no manager.finalize_stage() call anymore -- growth decisions
+        # were already made live, inside cost_fn, via manager.observe().
 
         stage_log.append(
             {
                 "step": step_guard,
                 "num_active_params": manager.num_active,
-                "energy": final_energy_this_stage,
                 "stage_budget": stage_budget,
-                "phases": phases_log,
-                "switched_at_eval": switched_at_eval,
-                "evals_this_stage": shared_history.n_evals - evals_before_stage,
+                "energy": stage_report.final_energy,
+                "phases": [(phase.optimizer, phase.iterations, phase.reason) for phase in stage_report.phases],
+                "switched_at_eval": stage_report.switched_at_eval,
+                "interrupted": stage_report.interrupted,
                 "cumulative_eval_at_stage_end": shared_history.n_evals,
             }
         )
+
+    # The last history entry may belong to a rejected/rolled-back trial
+    # rather than the ansatz we're actually keeping -- a rollback reverts
+    # parameters without re-measuring their energy. Do one confirming
+    # evaluation on the final retained ansatz/parameters so downstream
+    # reporting (and ZNE) measures the real final answer, not a stale one.
+    final_energy = float(
+        estimator.run([(manager.circuit, qubit_op, manager.parameters)]).result()[0].data.evs
+    )
+    shared_history.record(final_energy, manager.parameters, phase="final_confirmation")
 
     runtime = time.time() - t0
     return {
         "manager": manager,
         "final_circuit": manager.circuit,
         "final_params": manager.parameters,
+        "final_energy": final_energy,
         "history": shared_history,
         "stage_log": stage_log,
         "runtime_sec": runtime,
@@ -502,8 +516,8 @@ def run_adaptive_pipeline(
     max_qubits: int = 8,
     mapping: str = "jordan_wigner",
     stage_budget: int = 50,
-    rollback_confirmation_patience: int = 2,
-    budget_scale_per_param: int = 15,
+    budget_growth_per_param: int = 8,
+    rollback_patience: int = 2,
 ):
     """Run the adaptive 4A-4D pipeline for a selected molecule."""
     driver = build_driver_for_molecule(molecule_name)
@@ -522,11 +536,11 @@ def run_adaptive_pipeline(
         mapper,
         qubit_op,
         total_budget_per_stage=stage_budget,
-        rollback_confirmation_patience=rollback_confirmation_patience,
-        budget_scale_per_param=budget_scale_per_param,
+        budget_growth_per_param=budget_growth_per_param,
+        rollback_patience=rollback_patience,
     )
 
-    final_energy_electronic = grow_result["history"].energies[-1]
+    final_energy_electronic = grow_result["final_energy"]
     final_total_energy = final_energy_electronic + nuclear_repulsion
 
     zne_result = adaptive_zne(
