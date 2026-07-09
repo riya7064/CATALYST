@@ -41,10 +41,11 @@ This module owns:
 This module does NOT own:
     - the Hamiltonian / qubit mapper construction (inject a mapper)
     - the classical optimizer (SPSA, COBYLA, etc. -- lives in your VQE driver)
-    - the Estimator itself -- but it DOES need a way to ask for an energy
-      at an arbitrary circuit/parameter vector, purely for the cheap
-      gradient screen (2 evals per candidate, no optimization). That's
-      the `energy_evaluator` callable you pass in below.
+    - the Estimator itself -- but it DOES need a way to ask for energies
+      at a batch of arbitrary circuit/parameter vectors, purely for the
+      cheap gradient screen (2 evals per remaining candidate, no
+      optimization, submitted as ONE batched call per screening round).
+      That's the `energy_evaluator` callable you pass in below.
 
 Typical usage
 -------------
@@ -208,13 +209,16 @@ class AdaptiveAnsatzManager:
     ----------
     num_spatial_orbitals, num_particles, qubit_mapper :
         Same meaning as for qiskit-nature's UCC. Passed straight through.
-    energy_evaluator : Callable[[circuit, params], float]
-        Used ONLY for the cheap gradient screen: given a trial circuit and
-        a parameter vector, return its energy. The same function you
-        already call in your VQE cost function works here -- pass it in.
-        Each plateau costs `2 * len(remaining_pool)` calls to this (a
-        forward/backward finite difference per remaining candidate), which
-        is what replaces paying for a full optimization on every candidate.
+    energy_evaluator : Callable[[List[Tuple[circuit, params]]], List[float]]
+        Used ONLY for the cheap gradient screen. Given a LIST of (circuit,
+        params) pairs, return a list of energies, one per pair, in the
+        same order -- i.e. it should submit them as one batched Estimator
+        call rather than looping one at a time. Each screening round builds
+        `2 * len(remaining_pool)` such pairs (a forward/backward finite
+        difference per remaining candidate) and passes them all through in
+        a single call, which is what replaces paying for a full
+        optimization on every candidate AND avoids per-call dispatch
+        overhead on top of that.
     plateau_threshold : float
         |E_i - E_{i-1}| below this counts as "not improving" between
         consecutive evaluations -- used to detect that the *current* stage
@@ -453,29 +457,52 @@ class AdaptiveAnsatzManager:
     # Internal: gradient screening + grow/stop decision
     # ----------------------------------------------------------------
 
-    def _candidate_gradient(self, candidate_index: int) -> float:
-        """Cheap 2-eval finite-difference estimate of dE/dtheta for one
-        candidate excitation, at the current optimized parameters, with
-        the candidate's own parameter fixed at 0. No optimizer run."""
-        trial_indices = self.active_indices + [candidate_index]
-        trial_circuit = self._build_ucc_for_indices(trial_indices)
-
-        base = self.parameters
-        plus = np.concatenate([base, [self.gradient_eps]])
-        minus = np.concatenate([base, [-self.gradient_eps]])
-
-        e_plus = self.energy_evaluator(trial_circuit, plus)
-        e_minus = self.energy_evaluator(trial_circuit, minus)
-        return (e_plus - e_minus) / (2.0 * self.gradient_eps)
-
     def _screen_remaining_candidates(self) -> List[Tuple[int, float]]:
         """Returns [(pool_index, |gradient|), ...] for every excitation not
-        yet active, sorted by |gradient| descending."""
+        yet active, sorted by |gradient| descending.
+
+        All candidates' plus/minus finite-difference evaluations are
+        submitted through `energy_evaluator` in ONE batched call instead of
+        `2 * len(remaining)` separate ones -- circuit construction still
+        happens per-candidate (that part is inherent to screening a bigger
+        pool), but the actual energy evaluations no longer pay per-call
+        overhead one at a time.
+        """
+        import time as _time
+
         active_set = set(self.active_indices)
         remaining = [i for i in range(len(self.pool)) if i not in active_set]
-        scored = [(i, abs(self._candidate_gradient(i))) for i in remaining]
+        if not remaining:
+            return []
+
+        t0 = _time.time()
+        base = self.parameters
+        pairs: List[Tuple[Any, np.ndarray]] = []
+        for idx in remaining:
+            trial_indices = self.active_indices + [idx]
+            trial_circuit = self._build_ucc_for_indices(trial_indices)
+            plus = np.concatenate([base, [self.gradient_eps]])
+            minus = np.concatenate([base, [-self.gradient_eps]])
+            pairs.append((trial_circuit, plus))
+            pairs.append((trial_circuit, minus))
+
+        energies = self.energy_evaluator(pairs)  # <-- one batched call
+
+        scored = []
+        for k, idx in enumerate(remaining):
+            e_plus, e_minus = energies[2 * k], energies[2 * k + 1]
+            grad = (e_plus - e_minus) / (2.0 * self.gradient_eps)
+            scored.append((idx, abs(grad)))
         scored.sort(key=lambda pair: pair[1], reverse=True)
+
+        print(
+            f"  [screen] {len(remaining)} candidates, {len(pairs)} evals "
+            f"batched in {_time.time() - t0:.1f}s, best |grad|="
+            f"{scored[0][1]:.2e}" if scored else "  [screen] no candidates left",
+            flush=True,
+        )
         return scored
+
 
     def _grow_or_stop(self, settled_energy: float) -> bool:
         """Called once a stage has plateaued. Screens every remaining pool
@@ -590,20 +617,24 @@ if __name__ == "__main__":
         k = min(max(num_active - num_singles, 0), 6)
         return -1.0 - 3.0 * (1 - np.exp(-0.35 * k))
 
-    def fake_energy_evaluator(circuit, params: np.ndarray) -> float:
-        """Stands in for a real Estimator call during the gradient screen.
-        `params` is [existing optimized params..., candidate_theta]. Builds
-        a toy energy surface whose central-difference gradient in
-        candidate_theta exactly equals `true_energy(k) - true_energy(k+1)`
-        -- i.e. it reproduces, via finite differences, how much adding one
-        more excitation would actually lower the true energy curve above,
-        including saturating to ~0 once the curve flattens."""
-        k = len(params) - 1  # active excitations before this candidate
-        e_low = true_energy(k, manager._num_singles)
-        e_high = true_energy(k + 1, manager._num_singles)
-        slope = e_low - e_high
-        theta_new = params[-1]
-        return e_low - slope * np.sin(theta_new)
+    def fake_energy_evaluator(pairs) -> List[float]:
+        """Stands in for a real (batched) Estimator call during the
+        gradient screen. Each `params` in `pairs` is [existing optimized
+        params..., candidate_theta]. Builds a toy energy surface whose
+        central-difference gradient in candidate_theta exactly equals
+        `true_energy(k) - true_energy(k+1)` -- i.e. it reproduces, via
+        finite differences, how much adding one more excitation would
+        actually lower the true energy curve above, including saturating
+        to ~0 once the curve flattens."""
+        results = []
+        for _circuit, params in pairs:
+            k = len(params) - 1  # active excitations before this candidate
+            e_low = true_energy(k, manager._num_singles)
+            e_high = true_energy(k + 1, manager._num_singles)
+            slope = e_low - e_high
+            theta_new = params[-1]
+            results.append(e_low - slope * np.sin(theta_new))
+        return results
 
     manager = AdaptiveAnsatzManager(
         num_spatial_orbitals=4,

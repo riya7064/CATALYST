@@ -382,6 +382,7 @@ def run_learned_adaptive_ansatz(
     plateau_patience: int = 4,
     gradient_threshold: float = 1e-4,
     max_stages: int = 25,
+    spsa_min_delta: float = 1e-4,
 ):
     """Run the learned ansatz growth loop and return the final circuit plus logs.
 
@@ -395,14 +396,30 @@ def run_learned_adaptive_ansatz(
     gradient_threshold : forwarded to AdaptiveAnsatzManager -- the
         ADAPT-VQE stopping criterion. Once every remaining excitation's
         screened |gradient| falls below this, growth stops.
+    spsa_min_delta : how much the best-so-far energy has to improve over
+        `patience` evals before SPSA counts as "still improving". This was
+        previously left at 1e-7 -- far tighter than SPSA's own eval-to-eval
+        noise -- so SPSA almost never detected a plateau and burned its
+        *entire* stage_budget on every single growth step (and stage_budget
+        itself grows with num_active, so later stages paid the most). This
+        is the single biggest lever on total runtime: loosening it lets
+        COBYLA take over much sooner once SPSA has done its job.
     """
     # Used both for the real per-stage optimization (via ObservingCostFunction
     # below) and, here, as the manager's `energy_evaluator` for its cheap
-    # gradient screen (2 evals per remaining candidate, no optimization).
+    # gradient screen (2 evals per remaining candidate, no optimization) --
+    # batched into a single Estimator call per screening round instead of
+    # one call per candidate.
     estimator = StatevectorEstimator()
 
-    def energy_evaluator(circuit, params: np.ndarray) -> float:
-        return float(estimator.run([(circuit, qubit_op, params)]).result()[0].data.evs)
+    def energy_evaluator(pairs):
+        """pairs: List[(circuit, params)]. Runs every (circuit, params) pair
+        in ONE Estimator job instead of one job per candidate -- this is
+        what the screening step calls 2*len(remaining_candidates) worth of
+        evaluations through, now as a single batched call."""
+        pubs = [(circuit, qubit_op, params) for circuit, params in pairs]
+        results = estimator.run(pubs).result()
+        return [float(r.data.evs) for r in results]
 
     manager = AdaptiveAnsatzManager(
         num_spatial_orbitals=problem.num_spatial_orbitals,
@@ -431,7 +448,7 @@ def run_learned_adaptive_ansatz(
         cost_fn.phase = f"stage{manager.stage}(n={manager.num_active})"
 
         optimizer = AdaptiveVQEOptimizer(
-            criterion=ConvergenceCriterion(patience=5, min_delta=1e-7, min_evals=10)
+            criterion=ConvergenceCriterion(patience=5, min_delta=spsa_min_delta, min_evals=10)
         )
         stage_report = optimizer.optimize(cost_fn, x0, total_budget=stage_budget)
         # NOTE: no manager.finalize_stage() call anymore -- growth decisions
@@ -527,6 +544,7 @@ def run_adaptive_pipeline(
     stage_budget: int = 50,
     budget_growth_per_param: int = 8,
     gradient_threshold: float = 1e-4,
+    spsa_min_delta: float = 1e-4,
 ):
     """Run the adaptive 4A-4D pipeline for a selected molecule."""
     driver = build_driver_for_molecule(molecule_name)
@@ -547,6 +565,7 @@ def run_adaptive_pipeline(
         total_budget_per_stage=stage_budget,
         budget_growth_per_param=budget_growth_per_param,
         gradient_threshold=gradient_threshold,
+        spsa_min_delta=spsa_min_delta,
     )
 
     final_energy_electronic = grow_result["final_energy"]
